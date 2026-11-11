@@ -228,38 +228,66 @@ export const QuotationDocument: React.FC<QuotationDocumentProps> = ({
           </div>
         </div>
 
-        {/* Itemised Table */}
-        <div className="overflow-x-auto">
+        {/* Itemised Table (Desktop View & Print Document) */}
+        <div className="hidden md:block print:block overflow-x-auto">
           <table className="w-full text-xs text-left">
             <thead>
               <tr className="bg-[#071D3A] text-white">
                 <th className="py-2.5 px-3 font-semibold rounded-l-lg w-10 text-center">#</th>
-                <th className="py-2.5 px-3 font-semibold">Description</th>
-                <th className="py-2.5 px-3 font-semibold text-right w-20">Quantity</th>
-                <th className="py-2.5 px-3 font-semibold text-right w-24">Unit Price</th>
+                <th className="py-2.5 px-3 font-semibold min-w-[240px]">Description</th>
+                <th className="py-2.5 px-3 font-semibold text-right w-24">Quantity</th>
+                <th className="py-2.5 px-3 font-semibold text-right w-28">Unit Price</th>
                 <th className="py-2.5 px-3 font-semibold text-right rounded-r-lg w-28">Total</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-200 font-mono-numbers">
               {quotation.items.map((item, idx) => (
                 <tr key={item.id} className="hover:bg-slate-50">
-                  <td className="py-3 px-3 text-center text-slate-400 font-mono">{idx + 1}</td>
-                  <td className="py-3 px-3 font-sans font-medium text-[#172033]">
+                  <td className="py-3 px-3 text-center text-slate-400 font-mono align-top">{idx + 1}</td>
+                  <td className="py-3 px-3 font-sans font-medium text-[#172033] break-words leading-relaxed">
                     {item.item_description}
                   </td>
-                  <td className="py-3 px-3 text-right text-slate-700">
+                  <td className="py-3 px-3 text-right text-slate-700 align-top">
                     {item.quantity} {item.unit || 'pcs'}
                   </td>
-                  <td className="py-3 px-3 text-right text-slate-700">
+                  <td className="py-3 px-3 text-right text-slate-700 align-top">
                     {formatCurrency(item.unit_price)}
                   </td>
-                  <td className="py-3 px-3 text-right font-bold text-[#071D3A]">
+                  <td className="py-3 px-3 text-right font-bold text-[#071D3A] align-top">
                     {formatCurrency(item.line_total)}
                   </td>
                 </tr>
               ))}
             </tbody>
           </table>
+        </div>
+
+        {/* Itemised Cards (Mobile Screen View - iPhone Friendly) */}
+        <div className="md:hidden print:hidden space-y-2.5">
+          {quotation.items.map((item, idx) => (
+            <div
+              key={item.id}
+              className="p-3.5 bg-[#F4F6F9] rounded-xl border border-slate-200/90 space-y-2"
+            >
+              <div className="flex items-start justify-between gap-2">
+                <div className="flex items-start gap-2 min-w-0">
+                  <span className="px-1.5 py-0.5 bg-[#071D3A] text-white text-[10px] font-bold rounded font-mono shrink-0 mt-0.5">
+                    #{idx + 1}
+                  </span>
+                  <p className="text-xs sm:text-sm font-bold text-[#172033] leading-snug break-words">
+                    {item.item_description}
+                  </p>
+                </div>
+                <span className="text-xs sm:text-sm font-bold text-[#071D3A] font-mono shrink-0 bg-white px-2 py-0.5 rounded border border-slate-200">
+                  {formatCurrency(item.line_total)}
+                </span>
+              </div>
+              <div className="flex items-center justify-between text-[11px] text-slate-500 font-mono pt-1.5 border-t border-slate-200">
+                <span>Rate: {formatCurrency(item.unit_price)} / {item.unit || 'pcs'}</span>
+                <span>Qty: {item.quantity} {item.unit || 'pcs'}</span>
+              </div>
+            </div>
+          ))}
         </div>
 
         {/* Summary & Grand Total */}

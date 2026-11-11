@@ -589,35 +589,177 @@ export const QuotationManager: React.FC<QuotationManagerProps> = ({ data, onRefr
               </button>
             </div>
 
-            <div className="mt-4 overflow-x-auto">
+            {/* Mobile Stacked Cards Layout (iPhone & Small Viewports) */}
+            <div className="md:hidden mt-4 space-y-3">
+              {items.map((item, index) => (
+                <div
+                  key={item.id}
+                  className="bg-slate-50/90 p-3.5 rounded-xl border border-slate-200 shadow-2xs space-y-3 transition focus-within:bg-white focus-within:border-[#071D3A] focus-within:ring-1 focus-within:ring-[#071D3A]"
+                >
+                  {/* Card Header: Item Number, Line Total & Delete */}
+                  <div className="flex items-center justify-between pb-2 border-b border-slate-200/70">
+                    <div className="flex items-center gap-2">
+                      <span className="px-2 py-0.5 bg-[#071D3A] text-white text-[11px] font-bold rounded-md font-mono">
+                        #{index + 1}
+                      </span>
+                      <span className="text-[11px] font-bold text-slate-500 uppercase tracking-wider">
+                        Item Row
+                      </span>
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      <div className="text-right">
+                        <span className="text-xs font-bold text-[#071D3A] font-mono bg-white px-2 py-0.5 rounded-md border border-slate-200">
+                          {formatCurrency(item.line_total)}
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => handleDeleteItem(item.id)}
+                        className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition active:scale-95"
+                        aria-label={`Delete item ${index + 1}`}
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Full Description Textarea (Expands Vertically & Wraps Fully) */}
+                  <div>
+                    <label className="text-[11px] font-bold text-slate-600 uppercase tracking-wide block mb-1">
+                      Product Description *
+                    </label>
+                    <textarea
+                      rows={Math.max(2, Math.min(6, Math.ceil((item.item_description?.length || 0) / 28)))}
+                      required
+                      value={item.item_description}
+                      onChange={(e) => handleUpdateItem(item.id, 'item_description', e.target.value)}
+                      placeholder="e.g. 8 lengths of 15 mm copper pipe"
+                      className="w-full px-3 py-2 text-xs sm:text-sm border border-slate-300 rounded-lg font-medium text-[#172033] bg-white focus:ring-2 focus:ring-[#071D3A] focus:outline-hidden leading-relaxed resize-y min-h-[58px]"
+                    />
+                    {item.matched_from_library && (
+                      <span className="inline-flex items-center gap-1 text-[10px] text-emerald-700 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-md font-medium mt-1">
+                        ✓ Exact catalog match
+                      </span>
+                    )}
+                    {item.is_ambiguous && (
+                      <span className="inline-flex items-center gap-1 text-[10px] text-amber-800 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded-md font-medium mt-1">
+                        ⚠ {item.review_reason || 'Requires manual review'}
+                      </span>
+                    )}
+                  </div>
+
+                  {/* 3-Column Touch-Friendly Numeric Grid */}
+                  <div className="grid grid-cols-3 gap-2 pt-1">
+                    <div>
+                      <label className="text-[10px] font-bold text-slate-500 uppercase block mb-1">
+                        Quantity
+                      </label>
+                      <input
+                        type="number"
+                        step="0.1"
+                        min="0.01"
+                        required
+                        inputMode="decimal"
+                        value={item.quantity}
+                        onChange={(e) => handleUpdateItem(item.id, 'quantity', e.target.value)}
+                        className="w-full px-2.5 py-2 text-xs sm:text-sm border border-slate-300 rounded-lg font-mono font-bold text-[#071D3A] bg-white text-center focus:ring-2 focus:ring-[#071D3A] focus:outline-hidden"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="text-[10px] font-bold text-slate-500 uppercase block mb-1">
+                        Unit
+                      </label>
+                      <input
+                        type="text"
+                        value={item.unit}
+                        onChange={(e) => handleUpdateItem(item.id, 'unit', e.target.value)}
+                        placeholder="pcs"
+                        className="w-full px-2.5 py-2 text-xs sm:text-sm border border-slate-300 rounded-lg text-slate-800 bg-white text-center focus:ring-2 focus:ring-[#071D3A] focus:outline-hidden"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="text-[10px] font-bold text-slate-500 uppercase block mb-1">
+                        Price ($)
+                      </label>
+                      <input
+                        type="number"
+                        step="0.05"
+                        min="0"
+                        inputMode="decimal"
+                        value={item.unit_price === 0 ? '' : item.unit_price}
+                        placeholder="0.00"
+                        onChange={(e) => handleUpdateItem(item.id, 'unit_price', e.target.value)}
+                        className={`w-full px-2.5 py-2 text-xs sm:text-sm border rounded-lg font-mono font-bold text-right focus:ring-2 focus:ring-[#071D3A] focus:outline-hidden ${
+                          item.unit_price === 0
+                            ? 'border-amber-400 bg-amber-50/80 text-amber-900 placeholder:text-amber-500'
+                            : 'border-slate-300 text-slate-800 bg-white'
+                        }`}
+                      />
+                    </div>
+                  </div>
+
+                  {item.unit_price === 0 && (
+                    <div className="text-[10px] text-amber-700 bg-amber-50 border border-amber-200 px-2 py-1 rounded-md font-medium">
+                      ⚠️ Needs price quote ($0.00)
+                    </div>
+                  )}
+
+                  {/* Line Total Formula Breakdown */}
+                  <div className="flex items-center justify-between text-[11px] text-slate-500 pt-2 border-t border-slate-200/60 font-mono">
+                    <span>
+                      {item.quantity} {item.unit || 'pcs'} × ${item.unit_price.toFixed(2)}
+                    </span>
+                    <span className="font-bold text-[#071D3A]">
+                      Total: {formatCurrency(item.line_total)}
+                    </span>
+                  </div>
+                </div>
+              ))}
+
+              {/* Quick Add Row Button on Mobile */}
+              <button
+                type="button"
+                onClick={handleAddRow}
+                className="w-full py-2.5 px-3 border-2 border-dashed border-slate-300 hover:border-[#071D3A] hover:bg-slate-50 text-[#071D3A] text-xs font-bold rounded-xl flex items-center justify-center gap-1.5 transition active:scale-98"
+              >
+                <Plus className="w-4 h-4 text-[#F58220]" />
+                <span>Add Another Line Item</span>
+              </button>
+            </div>
+
+            {/* Desktop Spreadsheet Table (md and larger viewports) */}
+            <div className="hidden md:block mt-4 overflow-x-auto">
               <table className="w-full text-xs text-left">
                 <thead>
                   <tr className="bg-[#071D3A] text-white">
-                    <th className="py-2.5 px-3 rounded-l-lg font-semibold w-8 text-center">#</th>
-                    <th className="py-2.5 px-3 font-semibold">Item Description</th>
+                    <th className="py-2.5 px-3 rounded-l-lg font-semibold w-10 text-center">#</th>
+                    <th className="py-2.5 px-3 font-semibold min-w-[280px]">Item Description</th>
                     <th className="py-2.5 px-3 font-semibold w-24">Qty</th>
                     <th className="py-2.5 px-3 font-semibold w-24">Unit</th>
-                    <th className="py-2.5 px-3 font-semibold w-28">Unit Price ($)</th>
-                    <th className="py-2.5 px-3 font-semibold w-28 text-right">Line Total</th>
+                    <th className="py-2.5 px-3 font-semibold w-32">Unit Price ($)</th>
+                    <th className="py-2.5 px-3 font-semibold w-32 text-right">Line Total</th>
                     <th className="py-2.5 px-2 rounded-r-lg w-10 text-center"></th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-200">
                   {items.map((item, index) => (
                     <tr key={item.id} className="hover:bg-slate-50">
-                      <td className="py-2 px-3 text-center text-slate-400 font-mono">
+                      <td className="py-2.5 px-3 text-center text-slate-400 font-mono align-top pt-3">
                         {index + 1}
                       </td>
 
-                      {/* Description */}
-                      <td className="py-2 px-3">
-                        <input
-                          type="text"
+                      {/* Description - Auto-wrapping multiline textarea */}
+                      <td className="py-2.5 px-3">
+                        <textarea
+                          rows={Math.max(1, Math.min(4, Math.ceil((item.item_description?.length || 0) / 45)))}
                           required
                           value={item.item_description}
                           onChange={(e) => handleUpdateItem(item.id, 'item_description', e.target.value)}
                           placeholder="e.g. PVC pipes 19mm"
-                          className="w-full px-2 py-1.5 text-xs border border-slate-300 rounded font-medium focus:ring-1 focus:ring-[#071D3A] focus:outline-hidden"
+                          className="w-full px-2.5 py-1.5 text-xs border border-slate-300 rounded-lg font-medium text-[#172033] focus:ring-1 focus:ring-[#071D3A] focus:outline-hidden leading-relaxed resize-y"
                         />
                         {item.matched_from_library && (
                           <span className="text-[10px] text-emerald-600 font-medium block mt-0.5">
@@ -632,7 +774,7 @@ export const QuotationManager: React.FC<QuotationManagerProps> = ({ data, onRefr
                       </td>
 
                       {/* Quantity */}
-                      <td className="py-2 px-3">
+                      <td className="py-2.5 px-3 align-top">
                         <input
                           type="number"
                           step="0.1"
@@ -640,23 +782,23 @@ export const QuotationManager: React.FC<QuotationManagerProps> = ({ data, onRefr
                           required
                           value={item.quantity}
                           onChange={(e) => handleUpdateItem(item.id, 'quantity', e.target.value)}
-                          className="w-full px-2 py-1.5 text-xs border border-slate-300 rounded font-mono font-bold focus:ring-1 focus:ring-[#071D3A] focus:outline-hidden"
+                          className="w-full px-2 py-1.5 text-xs border border-slate-300 rounded-lg font-mono font-bold focus:ring-1 focus:ring-[#071D3A] focus:outline-hidden text-center"
                         />
                       </td>
 
                       {/* Unit */}
-                      <td className="py-2 px-3">
+                      <td className="py-2.5 px-3 align-top">
                         <input
                           type="text"
                           value={item.unit}
                           onChange={(e) => handleUpdateItem(item.id, 'unit', e.target.value)}
                           placeholder="pcs"
-                          className="w-full px-2 py-1.5 text-xs border border-slate-300 rounded focus:ring-1 focus:ring-[#071D3A] focus:outline-hidden"
+                          className="w-full px-2 py-1.5 text-xs border border-slate-300 rounded-lg focus:ring-1 focus:ring-[#071D3A] focus:outline-hidden text-center"
                         />
                       </td>
 
                       {/* Unit Price */}
-                      <td className="py-2 px-3">
+                      <td className="py-2.5 px-3 align-top">
                         <input
                           type="number"
                           step="0.05"
@@ -664,30 +806,31 @@ export const QuotationManager: React.FC<QuotationManagerProps> = ({ data, onRefr
                           value={item.unit_price === 0 ? '' : item.unit_price}
                           placeholder="0.00"
                           onChange={(e) => handleUpdateItem(item.id, 'unit_price', e.target.value)}
-                          className={`w-full px-2 py-1.5 text-xs border rounded font-mono font-bold focus:ring-1 focus:ring-[#071D3A] focus:outline-hidden ${
+                          className={`w-full px-2 py-1.5 text-xs border rounded-lg font-mono font-bold text-right focus:ring-1 focus:ring-[#071D3A] focus:outline-hidden ${
                             item.unit_price === 0
                               ? 'border-amber-400 bg-amber-50 text-amber-900 placeholder:text-amber-500'
                               : 'border-slate-300 text-slate-800'
                           }`}
                         />
                         {item.unit_price === 0 && (
-                          <span className="text-[9px] text-amber-700 block mt-0.5">
+                          <span className="text-[9px] text-amber-700 block mt-0.5 text-right">
                             Price needed ($0.00)
                           </span>
                         )}
                       </td>
 
                       {/* Line Total */}
-                      <td className="py-2 px-3 text-right font-mono font-bold text-[#071D3A]">
+                      <td className="py-2.5 px-3 text-right font-mono font-bold text-[#071D3A] align-top pt-3">
                         {formatCurrency(item.line_total)}
                       </td>
 
                       {/* Delete */}
-                      <td className="py-2 px-2 text-center">
+                      <td className="py-2.5 px-2 text-center align-top pt-2.5">
                         <button
                           type="button"
                           onClick={() => handleDeleteItem(item.id)}
-                          className="p-1 text-slate-400 hover:text-rose-600 rounded"
+                          className="p-1 text-slate-400 hover:text-rose-600 rounded transition"
+                          title="Remove item"
                         >
                           <Trash2 className="w-4 h-4" />
                         </button>
@@ -696,13 +839,13 @@ export const QuotationManager: React.FC<QuotationManagerProps> = ({ data, onRefr
                   ))}
                 </tbody>
               </table>
-
-              {items.length === 0 && (
-                <div className="py-8 text-center text-xs text-slate-400">
-                  Spreadsheet is empty. Paste raw text above or click "Add Row".
-                </div>
-              )}
             </div>
+
+            {items.length === 0 && (
+              <div className="py-8 text-center text-xs text-slate-400">
+                Spreadsheet is empty. Paste raw text above or click "Add Row".
+              </div>
+            )}
 
             {/* Calculations Footer */}
             <div className="mt-6 pt-4 border-t border-slate-200 flex flex-col sm:flex-row justify-between items-start gap-4">
@@ -815,7 +958,7 @@ export const QuotationManager: React.FC<QuotationManagerProps> = ({ data, onRefr
                       {q.customer_name}
                       {q.customer_phone ? ` (${q.customer_phone})` : ''}
                     </p>
-                    <p className="text-xs text-slate-500 truncate mt-0.5">
+                    <p className="text-xs text-slate-500 line-clamp-2 break-words mt-0.5">
                       {q.items.length} item(s): {q.items.map((i) => i.item_description).join(', ')}
                     </p>
                   </div>
