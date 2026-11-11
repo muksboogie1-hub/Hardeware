@@ -6,8 +6,15 @@
  * Enforces strict material, dimension, and unit safety rules.
  */
 
-import { PriceItem, QuotationLineItem } from '../types';
-import { multMoney } from './math';
+import {
+  PriceItem,
+  QuotationLineItem,
+  StructuredImportRow,
+  StructuredImportResult,
+  PriceLibraryImportProposal,
+  ProductCategory,
+} from '../types';
+import { multMoney, round2, subMoney } from './math';
 
 export interface ParsedRawLine {
   quantity: number;
@@ -546,3 +553,724 @@ export function parseRawQuotationText(
 
   return items;
 }
+
+// =========================================================================
+// STAGE 2: STRUCTURED QUOTATION IMPORT & PRICE LEARNING ENGINE
+// =========================================================================
+
+export const HEADER_DESCRIPTION_ALIASES = [
+  'item',
+  'description',
+  'item description',
+  'product',
+  'product description',
+  'product name',
+  'particulars',
+  'name',
+  'material',
+  'materials',
+  'details',
+  'spec',
+  'specification',
+  'items',
+  'desc',
+];
+
+export const HEADER_QUANTITY_ALIASES = [
+  'qty',
+  'quantity',
+  'quant',
+  'qnty',
+  'count',
+  'no',
+  'pcs',
+  'pieces',
+  'units',
+  'number',
+  'order qty',
+];
+
+export const HEADER_UNIT_ALIASES = [
+  'unit',
+  'uom',
+  'measure',
+  'unit of measure',
+  'pkg',
+];
+
+export const HEADER_UNIT_PRICE_ALIASES = [
+  'unit price',
+  'unit_price',
+  'price',
+  'rate',
+  'price each',
+  'price/unit',
+  'unit cost',
+  'cost',
+  'rate ($)',
+  'price ($)',
+  'unit price ($)',
+  'u/price',
+  'rate each',
+  'unit rate',
+];
+
+export const HEADER_TOTAL_ALIASES = [
+  'total',
+  'total price',
+  'amount',
+  'line total',
+  'total amount',
+  'ext price',
+  'extended price',
+  'net amount',
+  'total ($)',
+  'amount ($)',
+  'total cost',
+  'sub total',
+  'value',
+];
+
+export const SUMMARY_ROW_KEYWORDS = [
+  'subtotal',
+  'sub-total',
+  'sub total',
+  'grand total',
+  'total amount due',
+  'total due',
+  'balance due',
+  'vat',
+  'tax',
+  'discount',
+  'deposit',
+  'balance',
+  'amount payable',
+  'net total',
+  'total usd',
+  'grand total ($)',
+];
+
+export const METADATA_ROW_KEYWORDS = [
+  'quotation',
+  'quote #',
+  'quote no',
+  'quotation number',
+  'quotation ref',
+  'customer',
+  'client',
+  'customer name',
+  'date:',
+  'valid until',
+  'validity',
+  'prepared by',
+  'attn:',
+  'attention',
+  'terms and conditions',
+  'payment terms',
+  'bank details',
+  'banking details',
+  'account no',
+  'ecocash',
+  'phone:',
+  'tel:',
+  'email:',
+  'address:',
+];
+
+export interface ColumnMapping {
+  descriptionIndex: number;
+  quantityIndex: number;
+  unitIndex: number;
+  unitPriceIndex: number;
+  totalIndex: number;
+}
+
+/**
+ * Parses a single CSV line taking quoted commas and smart/curled quotes into account
+ */
+export function parseCsvLine(line: string): string[] {
+  const cells: string[] = [];
+  let current = '';
+  let inQuotes = false;
+  let quoteChar = '';
+
+  for (let i = 0; i < line.length; i++) {
+    const char = line[i];
+
+    if (!inQuotes && (char === '"' || char === "'" || char === '“' || char === '”')) {
+      inQuotes = true;
+      quoteChar = char === '“' ? '”' : char;
+    } else if (
+      inQuotes &&
+      (char === quoteChar ||
+        (quoteChar === '”' && (char === '”' || char === '"')) ||
+        (quoteChar === '"' && char === '"'))
+    ) {
+      inQuotes = false;
+    } else if (!inQuotes && char === ',') {
+      cells.push(current.trim().replace(/^["'“”]+|["'“”]+$/g, '').trim());
+      current = '';
+    } else {
+      current += char;
+    }
+  }
+  cells.push(current.trim().replace(/^["'“”]+|["'“”]+$/g, '').trim());
+  return cells;
+}
+
+/**
+ * Splits a tabular raw line into distinct column cells
+ * Supports: Tab-separated, Pipe-separated, CSV with quotes, Semicolons, and 2+ Whitespace columns.
+ */
+export function splitRowIntoCells(line: string): string[] {
+  const trimmed = line.trim();
+  if (!trimmed) return [];
+
+  // 1. Tab separated (Excel/Google Sheets copy paste)
+  if (trimmed.includes('\t')) {
+    return trimmed.split('\t').map((c) => c.trim().replace(/^["'“”]+|["'“”]+$/g, '').trim());
+  }
+
+  // 2. Pipe separated (| Item | Qty | Price |)
+  if (trimmed.includes('|')) {
+    const rawCells = trimmed.split('|');
+    const startIdx = rawCells[0].trim() === '' ? 1 : 0;
+    const endIdx =
+      rawCells[rawCells.length - 1].trim() === '' ? rawCells.length - 1 : rawCells.length;
+    const cells = rawCells.slice(startIdx, endIdx).map((c) => c.trim().replace(/^["'“”]+|["'“”]+$/g, '').trim());
+    if (cells.length > 0) return cells;
+  }
+
+  // 3. Comma separated (CSV), handles quoted values
+  if (trimmed.includes(',')) {
+    const cells = parseCsvLine(trimmed);
+    if (cells.length > 1) {
+      return cells;
+    }
+  }
+
+  // 4. Semicolon separated
+  if (trimmed.includes(';')) {
+    const cells = trimmed.split(';').map((c) => c.trim().replace(/^["'“”]+|["'“”]+$/g, '').trim());
+    if (cells.length > 1) return cells;
+  }
+
+  // 5. Multiple whitespace columns (aligned tables)
+  if (/\s{2,}/.test(trimmed)) {
+    return trimmed.split(/\s{2,}/).map((c) => c.trim().replace(/^["'“”]+|["'“”]+$/g, '').trim());
+  }
+
+  return [trimmed];
+}
+
+/**
+ * Safely parses monetary or quantity cell values.
+ * Handles currency symbols ($ USD ZiG R), thousands commas (1,200.00), and quotes.
+ */
+export function parseNumericCell(raw: string): { value: number | null; isValid: boolean } {
+  if (!raw || typeof raw !== 'string') return { value: null, isValid: false };
+
+  let clean = raw.trim().replace(/^["'“”]+|["'“”]+$/g, '').trim();
+  // Strip currency prefixes and suffixes
+  clean = clean.replace(/^(USD|ZIG|ZWL|ZAR|USD\$|\$|R|£|€)\s*/i, '').trim();
+  clean = clean.replace(/\s*(USD|ZIG|ZWL|ZAR)$/i, '').trim();
+
+  if (!clean) return { value: null, isValid: false };
+
+  // Remove commas used as thousands separators: e.g. "1,200.00" -> "1200.00"
+  if (/^[-+]?\d{1,3}(,\d{3})+(\.\d+)?$/.test(clean)) {
+    clean = clean.replace(/,/g, '');
+  } else if (/^[-+]?\d+,\d{2}$/.test(clean)) {
+    clean = clean.replace(',', '.');
+  } else {
+    clean = clean.replace(/,/g, '');
+  }
+
+  const num = parseFloat(clean);
+  if (isNaN(num) || !isFinite(num)) {
+    return { value: null, isValid: false };
+  }
+  return { value: round2(num), isValid: true };
+}
+
+/**
+ * Classifies a single header cell against known aliases
+ */
+function classifyHeaderCell(cell: string): 'description' | 'quantity' | 'unit' | 'unit_price' | 'total' | null {
+  const norm = cell.toLowerCase().trim().replace(/[^\w\s/]/g, '').replace(/\s+/g, ' ');
+
+  // 1. Unit price checks first before generic 'unit'
+  if (HEADER_UNIT_PRICE_ALIASES.some((a) => norm === a || norm.startsWith(a))) {
+    return 'unit_price';
+  }
+  // 2. Total / Amount
+  if (HEADER_TOTAL_ALIASES.some((a) => norm === a || norm.startsWith(a))) {
+    return 'total';
+  }
+  // 3. Quantity
+  if (HEADER_QUANTITY_ALIASES.some((a) => norm === a || norm.startsWith(a))) {
+    return 'quantity';
+  }
+  // 4. Unit
+  if (HEADER_UNIT_ALIASES.some((a) => norm === a)) {
+    return 'unit';
+  }
+  // 5. Description / Item
+  if (HEADER_DESCRIPTION_ALIASES.some((a) => norm === a || norm.startsWith(a))) {
+    return 'description';
+  }
+  return null;
+}
+
+/**
+ * Checks if a row is a table header row and establishes the column mapping
+ */
+export function classifyHeaderRow(cells: string[]): { isHeader: boolean; mapping: ColumnMapping } {
+  const mapping: ColumnMapping = {
+    descriptionIndex: -1,
+    quantityIndex: -1,
+    unitIndex: -1,
+    unitPriceIndex: -1,
+    totalIndex: -1,
+  };
+
+  let recognizedCount = 0;
+
+  for (let i = 0; i < cells.length; i++) {
+    const classification = classifyHeaderCell(cells[i]);
+    if (classification === 'description' && mapping.descriptionIndex === -1) {
+      mapping.descriptionIndex = i;
+      recognizedCount++;
+    } else if (classification === 'quantity' && mapping.quantityIndex === -1) {
+      mapping.quantityIndex = i;
+      recognizedCount++;
+    } else if (classification === 'unit' && mapping.unitIndex === -1) {
+      mapping.unitIndex = i;
+      recognizedCount++;
+    } else if (classification === 'unit_price' && mapping.unitPriceIndex === -1) {
+      mapping.unitPriceIndex = i;
+      recognizedCount++;
+    } else if (classification === 'total' && mapping.totalIndex === -1) {
+      mapping.totalIndex = i;
+      recognizedCount++;
+    }
+  }
+
+  // If at least two header columns were matched, this is definitely a header row
+  const isHeader = recognizedCount >= 2;
+  return { isHeader, mapping };
+}
+
+/**
+ * Determines whether a line is a summary row (e.g. Subtotal, Grand Total) or metadata row
+ */
+export function isSummaryOrMetadataRow(cells: string[], rawLine: string): { isSummary: boolean; isMetadata: boolean; label?: string } {
+  if (cells.length === 0) return { isSummary: false, isMetadata: false };
+
+  const first = cells[0].toLowerCase().trim().replace(/[^\w\s]/g, '');
+  const combined = cells.join(' ').toLowerCase().trim();
+
+  // 1. Explicit summary keywords in first cell or whole row
+  for (const kw of SUMMARY_ROW_KEYWORDS) {
+    if (first === kw || first.startsWith(kw)) {
+      return { isSummary: true, isMetadata: false, label: cells[0] };
+    }
+  }
+
+  // 2. Check metadata keywords
+  for (const meta of METADATA_ROW_KEYWORDS) {
+    if (combined.startsWith(meta) || first.startsWith(meta)) {
+      return { isSummary: false, isMetadata: true, label: cells[0] };
+    }
+  }
+
+  // 3. Check markdown table divider rows (e.g. |---|---|)
+  if (/^[:\-\s|]+$/.test(rawLine)) {
+    return { isSummary: false, isMetadata: true, label: 'divider' };
+  }
+
+  return { isSummary: false, isMetadata: false };
+}
+
+/**
+ * Infers column mapping for tabular data when no explicit header row was present
+ */
+function inferColumnMapping(cellsList: string[][]): ColumnMapping {
+  const mapping: ColumnMapping = {
+    descriptionIndex: 0,
+    quantityIndex: 1,
+    unitIndex: -1,
+    unitPriceIndex: 2,
+    totalIndex: 3,
+  };
+
+  if (cellsList.length === 0) return mapping;
+  const firstDataRow = cellsList[0];
+
+  if (firstDataRow.length === 3) {
+    // Description, Quantity, Unit Price
+    mapping.descriptionIndex = 0;
+    mapping.quantityIndex = 1;
+    mapping.unitPriceIndex = 2;
+    mapping.totalIndex = -1;
+  } else if (firstDataRow.length === 4) {
+    // Check if column 0 is numeric (Qty) and column 1 is text (Description)
+    const col0Num = parseNumericCell(firstDataRow[0]);
+    const col1Num = parseNumericCell(firstDataRow[1]);
+    if (col0Num.isValid && !col1Num.isValid) {
+      mapping.quantityIndex = 0;
+      mapping.descriptionIndex = 1;
+      mapping.unitPriceIndex = 2;
+      mapping.totalIndex = 3;
+    } else {
+      mapping.descriptionIndex = 0;
+      mapping.quantityIndex = 1;
+      mapping.unitPriceIndex = 2;
+      mapping.totalIndex = 3;
+    }
+  } else if (firstDataRow.length >= 5) {
+    mapping.descriptionIndex = 0;
+    mapping.quantityIndex = 1;
+    mapping.unitIndex = 2;
+    mapping.unitPriceIndex = 3;
+    mapping.totalIndex = 4;
+  }
+
+  return mapping;
+}
+
+/**
+ * PARSES STRUCTURED COMPLETED QUOTATIONS (WORKFLOW B & C)
+ * Extracts Description, Quantity, Unit Price, and Total Price from multi-column data.
+ * Detects headers, maps variable column order, ignores summary rows, and flags arithmetic discrepancies.
+ */
+export function parseStructuredQuotationText(
+  rawText: string,
+  priceLibrary: PriceItem[] = []
+): StructuredImportResult {
+  const lines = rawText.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+
+  let detectedHeaders: string[] = [];
+  let columnMapping: ColumnMapping = {
+    descriptionIndex: -1,
+    quantityIndex: -1,
+    unitIndex: -1,
+    unitPriceIndex: -1,
+    totalIndex: -1,
+  };
+
+  const validRows: StructuredImportRow[] = [];
+  const discrepancyRows: StructuredImportRow[] = [];
+  const unrecognizedRows: StructuredImportRow[] = [];
+  const summaryRows: StructuredImportRow[] = [];
+  const allRows: StructuredImportRow[] = [];
+
+  let headerFound = false;
+  const candidateDataLines: { rawLine: string; cells: string[] }[] = [];
+
+  // Pass 1: Header and Row Classification
+  for (const line of lines) {
+    const cells = splitRowIntoCells(line);
+    if (cells.length === 0) continue;
+
+    // Check if this row is a column header row
+    if (!headerFound) {
+      const headerCheck = classifyHeaderRow(cells);
+      if (headerCheck.isHeader) {
+        headerFound = true;
+        detectedHeaders = cells;
+        columnMapping = headerCheck.mapping;
+
+        // If totalIndex or unitPriceIndex were not explicitly mapped in a 4-col header, fill reasonable default
+        if (columnMapping.descriptionIndex === -1) columnMapping.descriptionIndex = 0;
+        if (columnMapping.quantityIndex === -1) columnMapping.quantityIndex = 1;
+        if (columnMapping.unitPriceIndex === -1 && columnMapping.totalIndex !== 2) columnMapping.unitPriceIndex = 2;
+        if (columnMapping.totalIndex === -1 && columnMapping.unitPriceIndex !== 3) columnMapping.totalIndex = 3;
+        continue;
+      }
+    }
+
+    // Check summary or metadata row
+    const checkSummary = isSummaryOrMetadataRow(cells, line);
+    if (checkSummary.isSummary) {
+      const summaryTotal = cells.length > 1 ? parseNumericCell(cells[cells.length - 1]).value || 0 : 0;
+      summaryRows.push({
+        id: generateUniqueId('s-sum'),
+        raw_line: line,
+        item_description: cells[0] || 'Summary',
+        quantity: 1,
+        unit: 'total',
+        unit_price: summaryTotal,
+        supplied_total: summaryTotal,
+        calculated_total: summaryTotal,
+        has_discrepancy: false,
+        is_valid: false,
+        status: 'summary',
+        review_reason: 'Recognized summary / grand total row (excluded from product list)',
+      });
+      continue;
+    }
+
+    if (checkSummary.isMetadata) {
+      continue; // Skip document titles, client headers, divider lines
+    }
+
+    candidateDataLines.push({ rawLine: line, cells });
+  }
+
+  // If no explicit header row was detected, infer column mapping from data
+  if (!headerFound && candidateDataLines.length > 0) {
+    columnMapping = inferColumnMapping(candidateDataLines.map((d) => d.cells));
+  }
+
+  // Pass 2: Extract and Validate Line Items
+  for (const { rawLine, cells } of candidateDataLines) {
+    // If line only has 1 cell and it's not a table row
+    if (cells.length === 1 && !headerFound) {
+      unrecognizedRows.push({
+        id: generateUniqueId('s-unrec'),
+        raw_line: rawLine,
+        item_description: cells[0],
+        quantity: 1,
+        unit: 'pcs',
+        unit_price: 0,
+        supplied_total: 0,
+        calculated_total: 0,
+        has_discrepancy: false,
+        is_valid: false,
+        status: 'unrecognized',
+        review_reason: 'Could not separate line into tabular columns',
+      });
+      continue;
+    }
+
+    // Extract Description
+    const descIdx = columnMapping.descriptionIndex >= 0 ? columnMapping.descriptionIndex : 0;
+    const rawDesc = cells[descIdx] || '';
+    const itemDescription = rawDesc.replace(/^["'“”]+|["'“”]+$/g, '').trim();
+
+    // Check if description itself is a summary row (e.g. "Total" or "Subtotal")
+    if (SUMMARY_ROW_KEYWORDS.some((kw) => itemDescription.toLowerCase() === kw || itemDescription.toLowerCase().startsWith(kw))) {
+      summaryRows.push({
+        id: generateUniqueId('s-sum'),
+        raw_line: rawLine,
+        item_description: itemDescription,
+        quantity: 1,
+        unit: 'total',
+        unit_price: 0,
+        supplied_total: 0,
+        calculated_total: 0,
+        has_discrepancy: false,
+        is_valid: false,
+        status: 'summary',
+        review_reason: 'Summary row detected (excluded from product list)',
+      });
+      continue;
+    }
+
+    // Extract Quantity
+    const qtyIdx = columnMapping.quantityIndex >= 0 ? columnMapping.quantityIndex : 1;
+    const rawQty = cells[qtyIdx];
+    const parsedQty = parseNumericCell(rawQty);
+
+    // Extract Unit
+    let unit = 'pcs';
+    if (columnMapping.unitIndex >= 0 && cells[columnMapping.unitIndex]) {
+      unit = cells[columnMapping.unitIndex].toLowerCase().trim() || 'pcs';
+    }
+
+    // Extract Unit Price
+    const priceIdx = columnMapping.unitPriceIndex >= 0 ? columnMapping.unitPriceIndex : 2;
+    const rawPrice = cells[priceIdx];
+    const parsedPrice = parseNumericCell(rawPrice);
+
+    // Extract Total
+    const totalIdx = columnMapping.totalIndex >= 0 ? columnMapping.totalIndex : 3;
+    const rawTotal = totalIdx >= 0 ? cells[totalIdx] : undefined;
+    const parsedTotal = rawTotal !== undefined ? parseNumericCell(rawTotal) : { value: null, isValid: false };
+
+    // Validation flags
+    const hasValidDesc = itemDescription.length > 0;
+    const hasValidQty = parsedQty.isValid && parsedQty.value !== null && parsedQty.value > 0;
+    const hasValidPrice = parsedPrice.isValid && parsedPrice.value !== null && parsedPrice.value >= 0;
+
+    const quantity = hasValidQty ? parsedQty.value! : 0;
+    const unitPrice = hasValidPrice ? parsedPrice.value! : 0;
+    const calculatedTotal = multMoney(unitPrice, quantity);
+    const suppliedTotal = parsedTotal.isValid && parsedTotal.value !== null ? parsedTotal.value : calculatedTotal;
+
+    // Check arithmetic discrepancy
+    let hasDiscrepancy = false;
+    let discrepancyReason: string | undefined;
+
+    if (parsedTotal.isValid && parsedTotal.value !== null && hasValidQty && hasValidPrice) {
+      const diff = Math.abs(subMoney(parsedTotal.value, calculatedTotal));
+      if (diff > 0.02) {
+        hasDiscrepancy = true;
+        discrepancyReason = `Supplied total ($${parsedTotal.value.toFixed(2)}) differs from Qty (${quantity}) × Price ($${unitPrice.toFixed(2)}) = $${calculatedTotal.toFixed(2)}`;
+      }
+    }
+
+    // Price catalog matching
+    const matchResult = matchProductWithLibrary(itemDescription, priceLibrary);
+    const matchedItem = matchResult.matchedItem;
+    const isAmbiguousMatch = matchResult.isAmbiguous;
+
+    let rowStatus: 'valid' | 'discrepancy' | 'invalid_numeric' | 'ambiguous' | 'unrecognized' = 'valid';
+    let reviewReason: string | undefined;
+
+    if (!hasValidDesc) {
+      rowStatus = 'unrecognized';
+      reviewReason = 'Missing product description';
+    } else if (!hasValidQty) {
+      rowStatus = 'invalid_numeric';
+      reviewReason = 'Invalid or missing quantity';
+    } else if (!hasValidPrice) {
+      rowStatus = 'invalid_numeric';
+      reviewReason = 'Invalid or missing unit price';
+    } else if (hasDiscrepancy) {
+      rowStatus = 'discrepancy';
+      reviewReason = discrepancyReason;
+    } else if (isAmbiguousMatch) {
+      rowStatus = 'ambiguous';
+      reviewReason = 'Ambiguous catalog match - check product specifications';
+    }
+
+    const rowObj: StructuredImportRow = {
+      id: generateUniqueId('str-row'),
+      raw_line: rawLine,
+      item_description: itemDescription,
+      quantity,
+      unit,
+      unit_price: unitPrice,
+      supplied_total: suppliedTotal,
+      calculated_total: calculatedTotal,
+      has_discrepancy: hasDiscrepancy,
+      is_valid: hasValidDesc && hasValidQty && hasValidPrice,
+      status: rowStatus,
+      review_reason: reviewReason,
+      matched_price_item: matchedItem,
+      is_ambiguous_match: isAmbiguousMatch,
+    };
+
+    allRows.push(rowObj);
+
+    if (rowStatus === 'valid' || rowStatus === 'ambiguous') {
+      validRows.push(rowObj);
+    } else if (rowStatus === 'discrepancy') {
+      discrepancyRows.push(rowObj);
+    } else {
+      unrecognizedRows.push(rowObj);
+    }
+  }
+
+  return {
+    headersDetected: detectedHeaders,
+    columnMapping,
+    validRows,
+    discrepancyRows,
+    unrecognizedRows,
+    summaryRows,
+    allRows,
+  };
+}
+
+/**
+ * PREPARES PRICE LIBRARY IMPORT PROPOSALS (WORKFLOW C)
+ * Extracts catalog prices from imported completed quotation.
+ * Uses Unit Price as proposed catalog price.
+ * Ignores Quantity and Total Price when setting catalog unit price.
+ * Detects conflicts when the same product appears multiple times with differing unit prices.
+ * Evaluates against existing Price Library with safe matching.
+ */
+export function preparePriceLibraryImport(
+  rows: StructuredImportRow[],
+  priceLibrary: PriceItem[] = []
+): PriceLibraryImportProposal[] {
+  // Group rows by standardized product name to detect conflicting prices within document
+  const grouped = new Map<string, { rows: StructuredImportRow[]; prices: Set<number> }>();
+
+  for (const row of rows) {
+    const desc = row.item_description.trim();
+    if (!desc || row.unit_price <= 0) continue;
+
+    const std = standardizeProductName(desc);
+    if (!grouped.has(std)) {
+      grouped.set(std, { rows: [], prices: new Set() });
+    }
+    const entry = grouped.get(std)!;
+    entry.rows.push(row);
+    entry.prices.add(row.unit_price);
+  }
+
+  const proposals: PriceLibraryImportProposal[] = [];
+
+  grouped.forEach((entry, std) => {
+    const firstRow = entry.rows[0];
+    const pricesArray = Array.from(entry.prices);
+    const hasConflict = pricesArray.length > 1;
+
+    // Match against existing library
+    const matchResult = matchProductWithLibrary(firstRow.item_description, priceLibrary);
+    const existing = matchResult.matchedItem;
+    const isAmbiguous = matchResult.isAmbiguous;
+
+    let status: 'new' | 'update' | 'same' | 'conflict' | 'ambiguous' = 'new';
+    let reviewReason: string | undefined;
+    let selected = false;
+
+    if (hasConflict) {
+      status = 'conflict';
+      selected = false;
+      reviewReason = `Conflicting unit prices found in document: ${pricesArray.map((p) => `$${p.toFixed(2)}`).join(', ')}`;
+    } else if (isAmbiguous) {
+      status = 'ambiguous';
+      selected = false;
+      reviewReason = 'Ambiguous catalog match - verify product specifications before adding';
+    } else if (existing) {
+      if (existing.current_unit_price === firstRow.unit_price) {
+        status = 'same';
+        selected = false;
+        reviewReason = `Current catalog price already matches ($${firstRow.unit_price.toFixed(2)})`;
+      } else {
+        status = 'update';
+        selected = true;
+        reviewReason = `Catalog price: $${existing.current_unit_price.toFixed(2)} → Proposed: $${firstRow.unit_price.toFixed(2)}`;
+      }
+    } else {
+      status = 'new';
+      selected = true;
+      reviewReason = 'New product to add to catalog';
+    }
+
+    // Infer category
+    let category: ProductCategory = existing?.category || 'hardware';
+    const descLower = firstRow.item_description.toLowerCase();
+    if (/pipe|coupling|elbow|valve|drain|tap|basin|sink|bath|shower|pvc|copper/i.test(descLower)) {
+      category = 'plumbing';
+    } else if (/wire|cable|switch|socket|breaker|conduit|light|bulb/i.test(descLower)) {
+      category = 'electrical';
+    } else if (/cement|brick|timber|sand|paint|roof|dpc|door/i.test(descLower)) {
+      category = 'building';
+    }
+
+    proposals.push({
+      id: generateUniqueId('plp'),
+      item_description: firstRow.item_description,
+      standardized_name: std,
+      proposed_unit_price: firstRow.unit_price,
+      unit: existing?.unit || firstRow.unit || 'pcs',
+      category,
+      existing_item: existing,
+      is_new: !existing,
+      is_conflict: hasConflict,
+      conflict_prices: hasConflict ? pricesArray : undefined,
+      status,
+      selected,
+      review_reason: reviewReason,
+    });
+  });
+
+  return proposals;
+}
+

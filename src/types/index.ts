@@ -163,8 +163,67 @@ export interface QuotationLineItem {
   unit: string;
   unit_price: number;
   line_total: number;
+  supplied_total?: number;
+  has_discrepancy?: boolean;
   matched_from_library: boolean;
   is_ambiguous?: boolean;
+  review_reason?: string;
+}
+
+export type ImportRowStatus =
+  | 'valid'
+  | 'discrepancy'
+  | 'invalid_numeric'
+  | 'ambiguous'
+  | 'summary'
+  | 'unrecognized';
+
+export interface StructuredImportRow {
+  id: string;
+  raw_line: string;
+  item_description: string;
+  quantity: number;
+  unit: string;
+  unit_price: number;
+  supplied_total: number;
+  calculated_total: number;
+  has_discrepancy: boolean;
+  is_valid: boolean;
+  status: ImportRowStatus;
+  review_reason?: string;
+  matched_price_item?: PriceItem | null;
+  is_ambiguous_match?: boolean;
+}
+
+export interface StructuredImportResult {
+  headersDetected: string[];
+  columnMapping: {
+    descriptionIndex: number;
+    quantityIndex: number;
+    unitIndex: number;
+    unitPriceIndex: number;
+    totalIndex: number;
+  };
+  validRows: StructuredImportRow[];
+  discrepancyRows: StructuredImportRow[];
+  unrecognizedRows: StructuredImportRow[];
+  summaryRows: StructuredImportRow[];
+  allRows: StructuredImportRow[];
+}
+
+export interface PriceLibraryImportProposal {
+  id: string;
+  item_description: string;
+  standardized_name: string;
+  proposed_unit_price: number;
+  unit: string;
+  category: ProductCategory;
+  existing_item?: PriceItem | null;
+  is_new: boolean;
+  is_conflict: boolean;
+  conflict_prices?: number[];
+  status: 'new' | 'update' | 'same' | 'conflict' | 'ambiguous';
+  selected: boolean;
   review_reason?: string;
 }
 
