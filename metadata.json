@@ -1,0 +1,6 @@
+{
+  "name": "Shucadea Manager",
+  "description": "Comprehensive business management system for Shucadea Hardware: white door batch accounting, brown door reinvestment, quotation generator with learning price library, and financial ledgers.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
