@@ -113,23 +113,10 @@ export const Navbar: React.FC<NavbarProps> = ({
             <div
               onClick={() => onSelectTab('settings')}
               className="cursor-pointer hidden sm:flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-medium bg-white/10 text-slate-200 border border-white/10 hover:bg-white/15"
-              title={
-                isSupabaseConnected
-                  ? 'Connected to Supabase PostgreSQL'
-                  : 'Operating in Local Storage (Configure Supabase in Settings)'
-              }
+              title="Persistent IndexedDB database active"
             >
-              {isSupabaseConnected ? (
-                <>
-                  <Cloud className="w-3.5 h-3.5 text-emerald-400" />
-                  <span className="text-emerald-300">Supabase Connected</span>
-                </>
-              ) : (
-                <>
-                  <Database className="w-3.5 h-3.5 text-amber-400" />
-                  <span className="text-amber-300">Local Storage</span>
-                </>
-              )}
+              <Database className="w-3.5 h-3.5 text-emerald-400" />
+              <span className="text-emerald-300 font-semibold">IndexedDB Local</span>
             </div>
 
             {/* PWA Install Button */}
@@ -173,12 +160,8 @@ export const Navbar: React.FC<NavbarProps> = ({
 
             <div className="pt-2 border-t border-white/10 flex items-center justify-between text-xs text-slate-300">
               <span className="flex items-center gap-1.5">
-                {isSupabaseConnected ? (
-                  <Cloud className="w-4 h-4 text-emerald-400" />
-                ) : (
-                  <Database className="w-4 h-4 text-amber-400" />
-                )}
-                {isSupabaseConnected ? 'Supabase Sync Active' : 'Local Offline Storage'}
+                <Database className="w-4 h-4 text-emerald-400" />
+                <span className="text-emerald-300">IndexedDB Local Storage</span>
               </span>
               <button
                 onClick={() => {
@@ -187,7 +170,7 @@ export const Navbar: React.FC<NavbarProps> = ({
                 }}
                 className="text-[#F58220] font-semibold underline"
               >
-                Configure
+                Settings
               </button>
             </div>
           </div>

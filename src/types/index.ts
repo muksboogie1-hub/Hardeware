@@ -164,6 +164,8 @@ export interface QuotationLineItem {
   unit_price: number;
   line_total: number;
   matched_from_library: boolean;
+  is_ambiguous?: boolean;
+  review_reason?: string;
 }
 
 export type QuotationStatus = 'draft' | 'confirmed' | 'accepted' | 'declined' | 'invoiced';
@@ -205,6 +207,7 @@ export interface BusinessSettings {
   supabase_url: string;
   supabase_anon_key: string;
   is_demo_mode: boolean;
+  last_backup_date?: string;
 }
 
 export interface AppDatabaseState {

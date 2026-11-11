@@ -11,16 +11,35 @@ import {
   AlertCircle,
   Copy,
   Share2,
+  BookOpen,
+  ArrowRight,
+  X,
+  FileCheck,
 } from 'lucide-react';
-import { AppDatabaseState, Quotation, QuotationLineItem } from '../../types';
+import { AppDatabaseState, Quotation, QuotationLineItem, PriceItem, ProductCategory } from '../../types';
 import { formatCurrency, multMoney, subMoney, addMoney } from '../../utils/math';
-import { parseRawQuotationText, findMatchingPriceItem } from '../../utils/quotationParser';
+import {
+  parseRawQuotationText,
+  matchProductWithLibrary,
+  generateUniqueId,
+  standardizeProductName,
+} from '../../utils/quotationParser';
 import { storage } from '../../services/storage';
 import { QuotationDocument } from './QuotationDocument';
 
 interface QuotationManagerProps {
   data: AppDatabaseState;
   onRefresh: () => void;
+}
+
+interface PriceLibraryDiffItem {
+  item_description: string;
+  category: ProductCategory;
+  unit: string;
+  quotation_price: number;
+  library_price?: number;
+  isNew: boolean;
+  selected: boolean;
 }
 
 export const QuotationManager: React.FC<QuotationManagerProps> = ({ data, onRefresh }) => {
@@ -40,10 +59,15 @@ export const QuotationManager: React.FC<QuotationManagerProps> = ({ data, onRefr
   const [quoteNumber, setQuoteNumber] = useState(
     `SH-${new Date().getFullYear()}-${String(data.quotations.length + 1).padStart(4, '0')}`
   );
+  const [quoteStatus, setQuoteStatus] = useState<'draft' | 'confirmed'>('confirmed');
   const [discount, setDiscount] = useState<number>(0);
   const [notes, setNotes] = useState('Quotation valid for 7 calendar days. Prices include local pickup.');
   const [items, setItems] = useState<QuotationLineItem[]>([]);
-  const [autoLearnPrices, setAutoLearnPrices] = useState(true);
+
+  // Explicit Price Library Update Modal
+  const [showPriceLearningModal, setShowPriceLearningModal] = useState(false);
+  const [diffItems, setDiffItems] = useState<PriceLibraryDiffItem[]>([]);
+  const [learningSuccessMsg, setLearningSuccessMsg] = useState<string | null>(null);
 
   // Parse raw text into spreadsheet rows
   const handleParseText = () => {
@@ -57,7 +81,7 @@ export const QuotationManager: React.FC<QuotationManagerProps> = ({ data, onRefr
     setItems([
       ...items,
       {
-        id: `item-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+        id: generateUniqueId('qi'),
         item_description: '',
         quantity: 1,
         unit: 'pcs',
@@ -68,7 +92,7 @@ export const QuotationManager: React.FC<QuotationManagerProps> = ({ data, onRefr
     ]);
   };
 
-  // Update specific row cell
+  // Update specific row cell with validation
   const handleUpdateItem = (
     id: string,
     field: keyof QuotationLineItem,
@@ -78,21 +102,38 @@ export const QuotationManager: React.FC<QuotationManagerProps> = ({ data, onRefr
       items.map((item) => {
         if (item.id !== id) return item;
 
-        const updated = { ...item, [field]: value };
+        let cleanValue = value;
+        if (field === 'quantity') {
+          // Reject negative quantity
+          cleanValue = Math.max(0.01, parseFloat(String(value)) || 0.01);
+        } else if (field === 'unit_price') {
+          // Reject negative price
+          cleanValue = Math.max(0, parseFloat(String(value)) || 0);
+        }
 
-        // If description changed, attempt to auto-match price
-        if (field === 'item_description' && typeof value === 'string') {
-          const match = findMatchingPriceItem(value, data.priceLibrary);
-          if (match) {
-            updated.unit_price = match.current_unit_price;
-            updated.unit = match.unit || updated.unit;
+        const updated = { ...item, [field]: cleanValue };
+
+        // If description changed, attempt safe price matching
+        if (field === 'item_description' && typeof cleanValue === 'string') {
+          const matchResult = matchProductWithLibrary(cleanValue, data.priceLibrary);
+          if (matchResult.matchedItem && matchResult.isExact) {
+            updated.unit_price = matchResult.matchedItem.current_unit_price;
+            updated.unit = matchResult.matchedItem.unit || updated.unit;
             updated.matched_from_library = true;
+            updated.is_ambiguous = false;
+            updated.review_reason = undefined;
+          } else if (matchResult.isAmbiguous) {
+            updated.matched_from_library = false;
+            updated.is_ambiguous = true;
+            updated.review_reason = 'Similar item in catalog. Check size & material specifications.';
+          } else {
+            updated.matched_from_library = false;
           }
         }
 
         // Recalculate line total safely
-        const qty = field === 'quantity' ? Number(value) : item.quantity;
-        const price = field === 'unit_price' ? Number(value) : item.unit_price;
+        const qty = field === 'quantity' ? Number(cleanValue) : item.quantity;
+        const price = field === 'unit_price' ? Number(cleanValue) : item.unit_price;
         updated.line_total = multMoney(price, qty);
 
         return updated;
@@ -107,10 +148,10 @@ export const QuotationManager: React.FC<QuotationManagerProps> = ({ data, onRefr
 
   // Calculations
   const subtotal = items.reduce((acc, item) => addMoney(acc, item.line_total), 0);
-  const grandTotal = Math.max(0, subMoney(subtotal, discount));
+  const grandTotal = Math.max(0, subMoney(subtotal, Math.max(0, discount)));
 
-  // Save Quotation & Learn Prices
-  const handleSaveQuotation = (e: React.FormEvent) => {
+  // Save Quotation (NEVER automatically updates permanent price library)
+  const handleSaveQuotation = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!customerName.trim()) {
       alert('Please enter a Customer Name');
@@ -121,40 +162,107 @@ export const QuotationManager: React.FC<QuotationManagerProps> = ({ data, onRefr
       return;
     }
 
-    const saved = storage.saveQuotation({
+    // Check for negative discount
+    const safeDiscount = Math.max(0, Number(discount) || 0);
+
+    const saved = await storage.saveQuotation({
       quotation_number: quoteNumber,
       date: quoteDate,
-      customer_name: customerName,
-      customer_phone: customerPhone,
-      customer_address: customerAddress,
+      customer_name: customerName.trim(),
+      customer_phone: customerPhone.trim() || undefined,
+      customer_address: customerAddress.trim() || undefined,
       subtotal,
-      discount: Number(discount),
+      discount: safeDiscount,
       grand_total: grandTotal,
-      status: 'confirmed',
+      status: quoteStatus,
       notes,
       raw_pasted_text: rawText,
       items,
     });
 
-    // Auto-learn new prices or update price library if user enabled learning
-    if (autoLearnPrices) {
-      items.forEach((item) => {
-        if (item.item_description.trim() && item.unit_price > 0) {
-          storage.saveOrUpdatePriceItem({
-            product_name: item.item_description.trim(),
-            standardized_name: item.item_description.trim().toLowerCase(),
-            category: 'hardware',
-            unit: item.unit || 'pcs',
-            current_unit_price: item.unit_price,
-            reason: `Confirmed quotation ${quoteNumber}`,
-          });
-        }
-      });
-    }
-
     onRefresh();
     setSelectedQuotation(saved);
     setActiveSubView('view');
+  };
+
+  // Open Price Library Update Review Modal (Explicit Confirmation)
+  const handleOpenPriceLearningModal = () => {
+    const activeItems = selectedQuotation ? selectedQuotation.items : items;
+    if (activeItems.length === 0) {
+      alert('No items to review for price library update.');
+      return;
+    }
+
+    const diffs: PriceLibraryDiffItem[] = [];
+
+    activeItems.forEach((item) => {
+      const desc = item.item_description.trim();
+      if (!desc || item.unit_price <= 0) return;
+
+      const matchResult = matchProductWithLibrary(desc, data.priceLibrary);
+      const matched = matchResult.matchedItem;
+
+      if (!matched) {
+        // New item
+        diffs.push({
+          item_description: desc,
+          category: 'hardware',
+          unit: item.unit || 'pcs',
+          quotation_price: item.unit_price,
+          isNew: true,
+          selected: true,
+        });
+      } else if (matched.current_unit_price !== item.unit_price) {
+        // Price changed
+        diffs.push({
+          item_description: desc,
+          category: matched.category || 'hardware',
+          unit: item.unit || matched.unit || 'pcs',
+          quotation_price: item.unit_price,
+          library_price: matched.current_unit_price,
+          isNew: false,
+          selected: true,
+        });
+      }
+    });
+
+    if (diffs.length === 0) {
+      alert('All items in this quotation already match the permanent Price Library prices. No updates needed.');
+      return;
+    }
+
+    setDiffItems(diffs);
+    setLearningSuccessMsg(null);
+    setShowPriceLearningModal(true);
+  };
+
+  // Commit selected price diffs to permanent library
+  const handleCommitPriceUpdates = async () => {
+    const selectedDiffs = diffItems.filter((d) => d.selected);
+    if (selectedDiffs.length === 0) {
+      alert('No items selected for library update.');
+      return;
+    }
+
+    const currentQuoteRef = selectedQuotation ? selectedQuotation.quotation_number : quoteNumber;
+
+    const payload = selectedDiffs.map((d) => ({
+      product_name: d.item_description,
+      standardized_name: standardizeProductName(d.item_description),
+      category: d.category,
+      unit: d.unit,
+      current_unit_price: d.quotation_price,
+      reason: `Confirmed quotation ${currentQuoteRef}`,
+    }));
+
+    await storage.batchUpdatePriceLibrary(payload);
+    onRefresh();
+
+    setLearningSuccessMsg(`Successfully committed ${selectedDiffs.length} price(s) to permanent library.`);
+    setTimeout(() => {
+      setShowPriceLearningModal(false);
+      setLearningSuccessMsg(null);
+    }, 1500);
   };
 
   // Start new quotation editor
@@ -164,6 +272,7 @@ export const QuotationManager: React.FC<QuotationManagerProps> = ({ data, onRefr
     setCustomerAddress('');
     setQuoteDate(new Date().toISOString().split('T')[0]);
     setQuoteNumber(`SH-${new Date().getFullYear()}-${String(data.quotations.length + 1).padStart(4, '0')}`);
+    setQuoteStatus('confirmed');
     setDiscount(0);
     setRawText(`2 x PVC pipes 19mm\n100 x Coupling\n100 x Nipples\n12 x Round boxes`);
     const initialItems = parseRawQuotationText(
@@ -181,12 +290,13 @@ export const QuotationManager: React.FC<QuotationManagerProps> = ({ data, onRefr
     setCustomerAddress(quote.customer_address || '');
     setQuoteDate(new Date().toISOString().split('T')[0]);
     setQuoteNumber(`SH-${new Date().getFullYear()}-${String(data.quotations.length + 1).padStart(4, '0')}`);
+    setQuoteStatus('confirmed');
     setDiscount(quote.discount || 0);
     setNotes(quote.notes || '');
     setItems(
       quote.items.map((i) => ({
         ...i,
-        id: `item-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+        id: generateUniqueId('qi'),
       }))
     );
     setActiveSubView('editor');
@@ -202,12 +312,134 @@ export const QuotationManager: React.FC<QuotationManagerProps> = ({ data, onRefr
   // Render Document View
   if (activeSubView === 'view' && selectedQuotation) {
     return (
-      <QuotationDocument
-        quotation={selectedQuotation}
-        settings={data.settings}
-        onBack={() => setActiveSubView('list')}
-        onDuplicate={handleDuplicateQuote}
-      />
+      <div className="space-y-4">
+        {/* Explicit Action Bar for Quotation Document */}
+        <div className="no-print bg-white p-3.5 rounded-2xl border border-slate-200 flex flex-wrap items-center justify-between gap-3 shadow-xs">
+          <div className="flex items-center gap-2">
+            <span className="text-xs font-semibold text-slate-600">
+              Quotation Status: <strong className="uppercase text-[#071D3A]">{selectedQuotation.status}</strong>
+            </span>
+            <span className="text-xs text-slate-400">·</span>
+            <span className="text-xs text-slate-500">
+              Permanent Library: Locked (historical quotes remain unchanged)
+            </span>
+          </div>
+
+          <button
+            onClick={handleOpenPriceLearningModal}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold text-[#071D3A] bg-orange-50 border border-orange-200 hover:bg-orange-100 rounded-lg transition"
+          >
+            <BookOpen className="w-3.5 h-3.5 text-[#F58220]" />
+            <span>Update Price Library with these Prices</span>
+          </button>
+        </div>
+
+        <QuotationDocument
+          quotation={selectedQuotation}
+          settings={data.settings}
+          onBack={() => setActiveSubView('list')}
+          onDuplicate={handleDuplicateQuote}
+        />
+
+        {/* Price Library Learning Confirmation Modal */}
+        {showPriceLearningModal && renderPriceLearningModal()}
+      </div>
+    );
+  }
+
+  function renderPriceLearningModal() {
+    return (
+      <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4">
+        <div className="w-full max-w-xl rounded-2xl bg-white p-5 sm:p-6 shadow-2xl border border-slate-200">
+          <div className="flex items-center justify-between pb-3 border-b border-slate-100">
+            <div className="flex items-center gap-2">
+              <div className="p-2 bg-[#071D3A] text-white rounded-xl">
+                <BookOpen className="w-5 h-5 text-[#F58220]" />
+              </div>
+              <div>
+                <h3 className="text-base font-bold text-[#071D3A]">
+                  Update Price Library from Quotation
+                </h3>
+                <p className="text-xs text-slate-500">
+                  Explicit confirmation required. Historical quotations will NOT be altered.
+                </p>
+              </div>
+            </div>
+            <button
+              onClick={() => setShowPriceLearningModal(false)}
+              className="p-1 text-slate-400 hover:text-slate-600 rounded"
+            >
+              <X className="w-5 h-5" />
+            </button>
+          </div>
+
+          {learningSuccessMsg ? (
+            <div className="py-8 text-center text-emerald-700 font-bold flex items-center justify-center gap-2">
+              <CheckCircle2 className="w-5 h-5" />
+              <span>{learningSuccessMsg}</span>
+            </div>
+          ) : (
+            <>
+              <div className="mt-4 max-h-72 overflow-y-auto divide-y divide-slate-100 border border-slate-200 rounded-xl">
+                {diffItems.map((diff, idx) => (
+                  <div key={idx} className="p-3 flex items-start gap-3 hover:bg-slate-50 text-xs">
+                    <input
+                      type="checkbox"
+                      checked={diff.selected}
+                      onChange={(e) => {
+                        const updated = [...diffItems];
+                        updated[idx].selected = e.target.checked;
+                        setDiffItems(updated);
+                      }}
+                      className="mt-1 rounded text-[#071D3A] focus:ring-[#071D3A]"
+                    />
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2">
+                        <span className="font-bold text-[#172033]">{diff.item_description}</span>
+                        <span
+                          className={`text-[10px] font-bold px-1.5 py-0.2 rounded uppercase ${
+                            diff.isNew
+                              ? 'bg-blue-50 text-blue-700'
+                              : 'bg-amber-50 text-amber-700'
+                          }`}
+                        >
+                          {diff.isNew ? 'New Product' : 'Price Change'}
+                        </span>
+                      </div>
+                      <div className="text-[11px] text-slate-500 mt-0.5 font-mono">
+                        {diff.isNew ? (
+                          <span>New Catalog Price: ${diff.quotation_price.toFixed(2)} / {diff.unit}</span>
+                        ) : (
+                          <span>
+                            Library: ${diff.library_price?.toFixed(2)} <ArrowRight className="inline w-3 h-3 text-slate-400" /> New: ${diff.quotation_price.toFixed(2)}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              <div className="flex items-center justify-end gap-2 pt-4 border-t border-slate-100 mt-4">
+                <button
+                  type="button"
+                  onClick={() => setShowPriceLearningModal(false)}
+                  className="px-4 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-100 rounded-lg"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={handleCommitPriceUpdates}
+                  className="px-5 py-2 text-xs font-bold text-white bg-[#071D3A] hover:bg-slate-800 rounded-xl shadow-xs"
+                >
+                  Confirm & Update Selected Prices
+                </button>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
     );
   }
 
@@ -220,7 +452,7 @@ export const QuotationManager: React.FC<QuotationManagerProps> = ({ data, onRefr
             Quotation Generator
           </h1>
           <p className="text-xs sm:text-sm text-slate-500 mt-0.5">
-            Excel-style spreadsheet with raw text pasting and self-learning price library
+            Excel-style spreadsheet with measurement-safe parsing and explicit price learning
           </p>
         </div>
 
@@ -268,7 +500,7 @@ export const QuotationManager: React.FC<QuotationManagerProps> = ({ data, onRefr
             </div>
 
             <p className="text-xs text-slate-500 mt-2 mb-2">
-              Paste customer WhatsApp text or bullet points (e.g. <code>2 x PVC pipes 19mm</code>, <code>100 x Coupling</code>, <code>8 lengths timber 2x4</code>).
+              Handles hardware specifications safely (e.g. <code>2 x PVC pipes 19mm</code>, <code>8 lengths of 15 mm copper pipe</code>, <code>3*2 timber</code>, <code>2x4 timber</code>, <code>19mm PVC pipe</code>).
             </p>
 
             <textarea
@@ -280,13 +512,13 @@ export const QuotationManager: React.FC<QuotationManagerProps> = ({ data, onRefr
             />
           </div>
 
-          {/* Quotation Details (Customer, Ref, Date) */}
+          {/* Quotation Details (Customer, Ref, Date, Status) */}
           <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-xs">
             <h3 className="text-sm font-bold text-[#071D3A] pb-3 border-b border-slate-100">
               Step 2: Customer & Document Information
             </h3>
 
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mt-4">
+            <div className="grid grid-cols-1 sm:grid-cols-4 gap-3 mt-4">
               <div>
                 <label className="text-xs font-semibold text-slate-600 block">Customer Name *</label>
                 <input
@@ -295,15 +527,15 @@ export const QuotationManager: React.FC<QuotationManagerProps> = ({ data, onRefr
                   placeholder="e.g. Mufakose Contractor"
                   value={customerName}
                   onChange={(e) => setCustomerName(e.target.value)}
-                  className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg focus:ring-2 focus:ring-[#071D3A] focus:outline-hidden"
+                  className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg focus:ring-2 focus:ring-[#071D3A] focus:outline-hidden font-medium"
                 />
               </div>
 
               <div>
-                <label className="text-xs font-semibold text-slate-600 block">Phone / WhatsApp</label>
+                <label className="text-xs font-semibold text-slate-600 block">Phone / WhatsApp (Optional)</label>
                 <input
                   type="text"
-                  placeholder="+263 77..."
+                  placeholder="+263..."
                   value={customerPhone}
                   onChange={(e) => setCustomerPhone(e.target.value)}
                   className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg focus:ring-2 focus:ring-[#071D3A] focus:outline-hidden"
@@ -320,6 +552,18 @@ export const QuotationManager: React.FC<QuotationManagerProps> = ({ data, onRefr
                   className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg font-mono focus:ring-2 focus:ring-[#071D3A] focus:outline-hidden"
                 />
               </div>
+
+              <div>
+                <label className="text-xs font-semibold text-slate-600 block">Status</label>
+                <select
+                  value={quoteStatus}
+                  onChange={(e) => setQuoteStatus(e.target.value as 'draft' | 'confirmed')}
+                  className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg focus:ring-2 focus:ring-[#071D3A] focus:outline-hidden font-semibold"
+                >
+                  <option value="confirmed">Confirmed (Approved)</option>
+                  <option value="draft">Draft (Pending Review)</option>
+                </select>
+              </div>
             </div>
           </div>
 
@@ -331,7 +575,7 @@ export const QuotationManager: React.FC<QuotationManagerProps> = ({ data, onRefr
                   Step 3: Interactive Spreadsheet Grid
                 </h3>
                 <p className="text-xs text-slate-500">
-                  Known items are auto-priced from the Price Library. Enter any missing prices.
+                  Known items are safely auto-priced without mixing dimensions. Negative numbers rejected.
                 </p>
               </div>
 
@@ -377,7 +621,12 @@ export const QuotationManager: React.FC<QuotationManagerProps> = ({ data, onRefr
                         />
                         {item.matched_from_library && (
                           <span className="text-[10px] text-emerald-600 font-medium block mt-0.5">
-                            ✓ Matched from library
+                            ✓ Exact catalog match
+                          </span>
+                        )}
+                        {item.is_ambiguous && (
+                          <span className="text-[10px] text-amber-700 font-medium block mt-0.5">
+                            ⚠ {item.review_reason || 'Requires manual review'}
                           </span>
                         )}
                       </td>
@@ -387,10 +636,10 @@ export const QuotationManager: React.FC<QuotationManagerProps> = ({ data, onRefr
                         <input
                           type="number"
                           step="0.1"
-                          min="0.1"
+                          min="0.01"
                           required
                           value={item.quantity}
-                          onChange={(e) => handleUpdateItem(item.id, 'quantity', parseFloat(e.target.value) || 0)}
+                          onChange={(e) => handleUpdateItem(item.id, 'quantity', e.target.value)}
                           className="w-full px-2 py-1.5 text-xs border border-slate-300 rounded font-mono font-bold focus:ring-1 focus:ring-[#071D3A] focus:outline-hidden"
                         />
                       </td>
@@ -412,16 +661,20 @@ export const QuotationManager: React.FC<QuotationManagerProps> = ({ data, onRefr
                           type="number"
                           step="0.05"
                           min="0"
-                          required
                           value={item.unit_price === 0 ? '' : item.unit_price}
                           placeholder="0.00"
-                          onChange={(e) => handleUpdateItem(item.id, 'unit_price', parseFloat(e.target.value) || 0)}
+                          onChange={(e) => handleUpdateItem(item.id, 'unit_price', e.target.value)}
                           className={`w-full px-2 py-1.5 text-xs border rounded font-mono font-bold focus:ring-1 focus:ring-[#071D3A] focus:outline-hidden ${
                             item.unit_price === 0
                               ? 'border-amber-400 bg-amber-50 text-amber-900 placeholder:text-amber-500'
                               : 'border-slate-300 text-slate-800'
                           }`}
                         />
+                        {item.unit_price === 0 && (
+                          <span className="text-[9px] text-amber-700 block mt-0.5">
+                            Price needed ($0.00)
+                          </span>
+                        )}
                       </td>
 
                       {/* Line Total */}
@@ -446,25 +699,18 @@ export const QuotationManager: React.FC<QuotationManagerProps> = ({ data, onRefr
 
               {items.length === 0 && (
                 <div className="py-8 text-center text-xs text-slate-400">
-                  Spreadsheet is empty. Paste raw text above and click "Parse & Populate Spreadsheet" or click "Add Row".
+                  Spreadsheet is empty. Paste raw text above or click "Add Row".
                 </div>
               )}
             </div>
 
             {/* Calculations Footer */}
             <div className="mt-6 pt-4 border-t border-slate-200 flex flex-col sm:flex-row justify-between items-start gap-4">
-              {/* Learning Price Library Checkbox */}
-              <div className="flex items-start gap-2">
-                <input
-                  type="checkbox"
-                  id="autoLearn"
-                  checked={autoLearnPrices}
-                  onChange={(e) => setAutoLearnPrices(e.target.checked)}
-                  className="mt-0.5 rounded text-[#071D3A] focus:ring-[#071D3A]"
-                />
-                <label htmlFor="autoLearn" className="text-xs text-slate-600 cursor-pointer">
-                  <strong className="text-[#071D3A]">Learning Price Library:</strong> Automatically save confirmed product prices to the library for future quotations.
-                </label>
+              <div className="text-xs text-slate-500 max-w-sm">
+                <span className="font-bold text-[#071D3A] block mb-1">Price Library Safety:</span>
+                <p>
+                  Saving this quotation records it safely without modifying the permanent Price Library. To update the Price Library with these prices, you can explicitly review and confirm changes after saving.
+                </p>
               </div>
 
               {/* Grand Total Display */}
@@ -480,7 +726,7 @@ export const QuotationManager: React.FC<QuotationManagerProps> = ({ data, onRefr
                     step="0.5"
                     min="0"
                     value={discount}
-                    onChange={(e) => setDiscount(parseFloat(e.target.value) || 0)}
+                    onChange={(e) => setDiscount(Math.max(0, parseFloat(e.target.value) || 0))}
                     className="w-24 px-2 py-1 text-xs border border-slate-300 rounded font-mono text-right"
                   />
                 </div>
@@ -505,7 +751,7 @@ export const QuotationManager: React.FC<QuotationManagerProps> = ({ data, onRefr
                 className="flex items-center gap-2 px-6 py-2.5 text-xs font-bold text-white bg-[#071D3A] hover:bg-slate-800 rounded-xl shadow-xs active:scale-95 transition"
               >
                 <Save className="w-4 h-4 text-[#F58220]" />
-                <span>Save & Generate Official Document</span>
+                <span>Save Quotation</span>
               </button>
             </div>
           </div>
@@ -535,7 +781,7 @@ export const QuotationManager: React.FC<QuotationManagerProps> = ({ data, onRefr
                 All Saved Quotations ({filteredQuotations.length})
               </span>
               <span className="text-xs text-slate-400">
-                Click any quotation to view, print, or share via WhatsApp
+                Click any quotation to view, print, or share
               </span>
             </div>
 
@@ -555,7 +801,13 @@ export const QuotationManager: React.FC<QuotationManagerProps> = ({ data, onRefr
                         {q.quotation_number}
                       </span>
                       <span className="text-xs text-slate-400 font-mono-numbers">{q.date}</span>
-                      <span className="text-[10px] uppercase font-bold px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700">
+                      <span
+                        className={`text-[10px] uppercase font-bold px-1.5 py-0.5 rounded ${
+                          q.status === 'confirmed'
+                            ? 'bg-emerald-50 text-emerald-700'
+                            : 'bg-slate-100 text-slate-600'
+                        }`}
+                      >
                         {q.status}
                       </span>
                     </div>

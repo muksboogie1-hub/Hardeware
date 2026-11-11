@@ -1,12 +1,12 @@
 /**
  * @license
  * SPDX-License-Identifier: Apache-2.0
- * Persistent Storage & Supabase Sync Engine for Shucadea Manager
- * Guarantees local-first offline availability, safe storage, and Supabase integration.
+ * Shucadea Manager — Persistent Storage Manager
+ * Uses IndexedDB as the primary source of truth with in-memory write-through caching.
  */
 
-import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import {
+  AppDatabaseState,
   BusinessSettings,
   DailyClosing,
   FinancialTransaction,
@@ -17,323 +17,154 @@ import {
   BrownDoorPurchase,
   BrownDoorSale,
   BrownDoorWithdrawal,
-  AppDatabaseState,
 } from '../types';
-import {
-  DEFAULT_BUSINESS_SETTINGS,
-  DEMO_WHITE_BATCHES,
-  DEMO_WHITE_SALES,
-  DEMO_BROWN_PURCHASES,
-  DEMO_BROWN_SALES,
-  DEMO_PRICE_LIBRARY,
-  DEMO_QUOTATIONS,
-} from '../constants';
+import { DEFAULT_BUSINESS_SETTINGS } from '../constants';
 import { multMoney, subMoney, addMoney } from '../utils/math';
+import { shucadeaDB, MigrationSummary } from './db';
 
-const LIVE_STORAGE_KEY = 'shucadea_manager_live_data_v1';
-const DEMO_STORAGE_KEY = 'shucadea_manager_demo_data_v1';
-const SETTINGS_STORAGE_KEY = 'shucadea_manager_settings_v1';
-
-function getInitialEmptyLiveState(settings: BusinessSettings): AppDatabaseState {
-  return {
-    settings,
-    whiteBatches: [],
-    whiteSales: [],
-    brownPurchases: [],
-    brownSales: [],
-    brownWithdrawals: [],
-    doorTransactions: [],
-    hardwareTransactions: [],
-    dailyClosings: [],
-    priceLibrary: [],
-    quotations: [],
-  };
-}
-
-function getInitialDemoState(settings: BusinessSettings): AppDatabaseState {
-  // Precompute demo transactions
-  const doorTransactions: FinancialTransaction[] = [
-    {
-      id: 'dt-1',
-      date: '2026-11-01',
-      business_segment: 'doors',
-      door_type: 'white',
-      type: 'expense',
-      category: 'Stock Restock',
-      amount: 460,
-      payment_method: 'cash',
-      description: 'Purchased 20 White Doors @ $23 (Batch WD-2026-001)',
-      is_personal_withdrawal: false,
-      created_at: '2026-11-01T08:00:00Z',
-    },
-    {
-      id: 'dt-2',
-      date: '2026-11-01',
-      business_segment: 'doors',
-      door_type: 'white',
-      type: 'expense',
-      category: 'Transport',
-      amount: 25,
-      payment_method: 'cash',
-      description: 'Transport for 20 White Doors (Batch WD-2026-001)',
-      is_personal_withdrawal: false,
-      created_at: '2026-11-01T08:15:00Z',
-    },
-    {
-      id: 'dt-3',
-      date: '2026-11-01',
-      business_segment: 'doors',
-      door_type: 'brown',
-      type: 'expense',
-      category: 'Stock Restock',
-      amount: 140,
-      payment_method: 'cash',
-      description: 'Purchased 10 Brown Doors @ $14 (Initial capacity)',
-      is_personal_withdrawal: false,
-      created_at: '2026-11-01T08:30:00Z',
-    },
-    {
-      id: 'dt-4',
-      date: '2026-11-04',
-      business_segment: 'doors',
-      door_type: 'white',
-      type: 'income',
-      category: 'Door Sale',
-      amount: 528,
-      payment_method: 'cash',
-      description: 'Collected revenue from Batch WD-2026-001 (12 FB @ $26, 8 Walk-in @ $27)',
-      is_personal_withdrawal: false,
-      created_at: '2026-11-04T15:00:00Z',
-    },
-    {
-      id: 'dt-5',
-      date: '2026-11-04',
-      business_segment: 'doors',
-      door_type: 'brown',
-      type: 'income',
-      category: 'Door Sale',
-      amount: 180,
-      payment_method: 'cash',
-      description: 'Sold 10 Brown Doors @ $18 each',
-      is_personal_withdrawal: false,
-      created_at: '2026-11-04T16:00:00Z',
-    },
-    {
-      id: 'dt-6',
-      date: '2026-11-05',
-      business_segment: 'doors',
-      door_type: 'brown',
-      type: 'withdrawal',
-      category: 'Personal Withdrawal',
-      amount: 30,
-      payment_method: 'cash',
-      description: 'Personal withdrawal by owner (kept separate from operating expenses)',
-      is_personal_withdrawal: true,
-      created_at: '2026-11-05T12:00:00Z',
-    },
-  ];
-
-  const hardwareTransactions: FinancialTransaction[] = [
-    {
-      id: 'ht-1',
-      date: '2026-11-03',
-      business_segment: 'hardware',
-      type: 'income',
-      category: 'Hardware Sale',
-      amount: 104.50,
-      payment_method: 'cash',
-      description: 'Quotation SH-2026-0084 paid in cash (PVC pipes & fittings)',
-      is_personal_withdrawal: false,
-      created_at: '2026-11-03T11:30:00Z',
-    },
-    {
-      id: 'ht-2',
-      date: '2026-11-04',
-      business_segment: 'hardware',
-      type: 'expense',
-      category: 'Operating Expense',
-      amount: 20,
-      payment_method: 'cash',
-      description: 'Shop lighting repair & electrical tape',
-      is_personal_withdrawal: false,
-      created_at: '2026-11-04T10:00:00Z',
-    },
-  ];
-
-  const dailyClosings: DailyClosing[] = [
-    {
-      id: 'close-1',
-      closing_date: '2026-11-09',
-      closed_at: '2026-11-09T18:00:00Z',
-      white_doors_sold: 5,
-      brown_doors_sold: 6,
-      sales_revenue: 238, // 5*26 (130) + 6*18 (108)
-      collected_cash: 238,
-      outstanding_payments: 0,
-      transport_expenses: 0,
-      other_expenses: 15, // shop consumable
-      personal_withdrawals: 0,
-      expected_cash: 223, // 238 - 15
-      actual_cash_counted: 223,
-      discrepancy: 0,
-      closed_by: 'Shop Manager',
-      status: 'balanced',
-      audit_history: [
-        {
-          timestamp: '2026-11-09T18:00:00Z',
-          action: 'Daily Closing Created',
-          user: 'Shop Manager',
-          changes: 'Closed with zero discrepancy. Cash in drawer: $223.',
-        },
-      ],
-    },
-  ];
-
-  return {
-    settings,
-    whiteBatches: DEMO_WHITE_BATCHES,
-    whiteSales: DEMO_WHITE_SALES,
-    brownPurchases: DEMO_BROWN_PURCHASES,
-    brownSales: DEMO_BROWN_SALES,
-    brownWithdrawals: [
-      {
-        id: 'bw-1',
-        withdrawal_date: '2026-11-05',
-        amount: 30,
-        withdrawn_by: 'Owner',
-        reason: 'Personal expense withdrawal',
-        created_at: '2026-11-05T12:00:00Z',
-      },
-    ],
-    doorTransactions,
-    hardwareTransactions,
-    dailyClosings,
-    priceLibrary: DEMO_PRICE_LIBRARY,
-    quotations: DEMO_QUOTATIONS,
+export interface BackupValidationResult {
+  valid: boolean;
+  error?: string;
+  summary?: {
+    exportDate?: string;
+    quotationCount: number;
+    priceLibraryCount: number;
+    whiteBatchesCount: number;
+    brownPurchasesCount: number;
+    transactionsCount: number;
+    dailyClosingsCount: number;
   };
 }
 
 class StorageManager {
   private memoryState: AppDatabaseState | null = null;
-  private supabaseClient: SupabaseClient | null = null;
+  private isInitializing: Promise<AppDatabaseState> | null = null;
 
   constructor() {
-    this.init();
+    // Initial sync bootstrap
   }
 
-  private loadSettings(): BusinessSettings {
-    try {
-      const raw = localStorage.getItem(SETTINGS_STORAGE_KEY);
-      if (raw) {
-        return { ...DEFAULT_BUSINESS_SETTINGS, ...JSON.parse(raw) };
-      }
-    } catch {
-      // ignore
+  /**
+   * Initializes IndexedDB, handles safe migration from localStorage,
+   * and loads state into memory cache.
+   */
+  public async init(): Promise<AppDatabaseState> {
+    if (this.isInitializing) {
+      return this.isInitializing;
     }
-    return DEFAULT_BUSINESS_SETTINGS;
-  }
 
-  public saveSettings(settings: BusinessSettings): void {
-    try {
-      localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
-      if (this.memoryState) {
-        this.memoryState.settings = settings;
-        this.persist();
-      }
-      this.reconnectSupabase(settings.supabase_url, settings.supabase_anon_key);
-    } catch (e) {
-      console.error('Failed to save settings to localStorage', e);
-    }
-  }
-
-  public reconnectSupabase(url: string, key: string): SupabaseClient | null {
-    if (url && key) {
+    this.isInitializing = (async () => {
       try {
-        this.supabaseClient = createClient(url, key);
-        return this.supabaseClient;
+        // Run migration check first
+        await shucadeaDB.migrateFromLocalStorageIfNeeded();
+
+        // Load settings to check demo mode
+        const live = await shucadeaDB.loadLiveState();
+        if (live.settings.is_demo_mode) {
+          this.memoryState = await shucadeaDB.loadDemoState(live.settings);
+        } else {
+          this.memoryState = live;
+        }
+
+        return this.memoryState;
       } catch (err) {
-        console.error('Failed to initialize Supabase client:', err);
-      }
-    }
-    this.supabaseClient = null;
-    return null;
-  }
-
-  public getSupabase(): SupabaseClient | null {
-    return this.supabaseClient;
-  }
-
-  public init(): AppDatabaseState {
-    const settings = this.loadSettings();
-    if (settings.supabase_url && settings.supabase_anon_key) {
-      this.reconnectSupabase(settings.supabase_url, settings.supabase_anon_key);
-    }
-
-    const key = settings.is_demo_mode ? DEMO_STORAGE_KEY : LIVE_STORAGE_KEY;
-    try {
-      const saved = localStorage.getItem(key);
-      if (saved) {
-        const parsed = JSON.parse(saved);
+        console.error('Failed to initialize IndexedDB storage:', err);
+        // Fallback to defaults in memory if DB fails
         this.memoryState = {
-          ...parsed,
-          settings,
+          settings: DEFAULT_BUSINESS_SETTINGS,
+          whiteBatches: [],
+          whiteSales: [],
+          brownPurchases: [],
+          brownSales: [],
+          brownWithdrawals: [],
+          doorTransactions: [],
+          hardwareTransactions: [],
+          dailyClosings: [],
+          priceLibrary: [],
+          quotations: [],
         };
-        return this.memoryState!;
+        return this.memoryState;
+      } finally {
+        this.isInitializing = null;
       }
-    } catch {
-      // ignore
-    }
+    })();
 
-    // Default initialization
-    this.memoryState = settings.is_demo_mode
-      ? getInitialDemoState(settings)
-      : getInitialEmptyLiveState(settings);
-
-    this.persist();
-    return this.memoryState;
+    return this.isInitializing;
   }
 
+  /**
+   * Synchronous getter for in-memory state
+   */
   public getState(): AppDatabaseState {
     if (!this.memoryState) {
-      return this.init();
+      // Return safe empty state while DB is resolving
+      return {
+        settings: DEFAULT_BUSINESS_SETTINGS,
+        whiteBatches: [],
+        whiteSales: [],
+        brownPurchases: [],
+        brownSales: [],
+        brownWithdrawals: [],
+        doorTransactions: [],
+        hardwareTransactions: [],
+        dailyClosings: [],
+        priceLibrary: [],
+        quotations: [],
+      };
     }
     return this.memoryState;
   }
 
-  public toggleDemoMode(enableDemo: boolean): AppDatabaseState {
-    const currentSettings = this.loadSettings();
-    currentSettings.is_demo_mode = enableDemo;
-    this.saveSettings(currentSettings);
-    return this.init();
+  public getMigrationStatus(): MigrationSummary | null {
+    return shucadeaDB.getMigrationStatus();
   }
 
-  private persist(): void {
-    if (!this.memoryState) return;
-    const key = this.memoryState.settings.is_demo_mode ? DEMO_STORAGE_KEY : LIVE_STORAGE_KEY;
-    try {
-      localStorage.setItem(key, JSON.stringify(this.memoryState));
-    } catch (e) {
-      console.error('Failed to persist to localStorage', e);
+  /**
+   * Save Business Settings
+   */
+  public async saveSettings(settings: BusinessSettings): Promise<void> {
+    const state = this.getState();
+    state.settings = settings;
+    await shucadeaDB.saveSettings(settings);
+    if (settings.is_demo_mode) {
+      await shucadeaDB.saveDemoState(state);
     }
+  }
+
+  /**
+   * Toggle between Demo mode and Live mode
+   */
+  public async toggleDemoMode(enableDemo: boolean): Promise<AppDatabaseState> {
+    const state = this.getState();
+    state.settings.is_demo_mode = enableDemo;
+    await shucadeaDB.saveSettings(state.settings);
+
+    if (enableDemo) {
+      this.memoryState = await shucadeaDB.loadDemoState(state.settings);
+    } else {
+      this.memoryState = await shucadeaDB.loadLiveState();
+    }
+
+    return this.memoryState;
   }
 
   // ==========================================
   // WHITE DOORS ACTIONS
   // ==========================================
 
-  public createWhiteBatch(data: {
+  public async createWhiteBatch(data: {
     batch_number: string;
     purchase_date: string;
     quantity_purchased: number;
     purchase_price_per_door: number;
     transport_cost: number;
     notes?: string;
-  }): WhiteDoorBatch {
+  }): Promise<WhiteDoorBatch> {
     const state = this.getState();
     const totalCost = multMoney(data.purchase_price_per_door, data.quantity_purchased);
 
     const newBatch: WhiteDoorBatch = {
-      id: `wb-${Date.now()}`,
+      id: `wb-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
       batch_number: data.batch_number,
       purchase_date: data.purchase_date,
       quantity_purchased: data.quantity_purchased,
@@ -347,7 +178,7 @@ class StorageManager {
       total_collected_revenue: 0,
       unpaid_sales_amount: 0,
       gross_profit: 0,
-      net_profit: subMoney(0, data.transport_cost), // Net profit begins with transport deducted
+      net_profit: subMoney(0, data.transport_cost),
       status: 'active',
       notes: data.notes,
       created_at: new Date().toISOString(),
@@ -355,8 +186,7 @@ class StorageManager {
 
     state.whiteBatches.unshift(newBatch);
 
-    // Auto-record purchase and transport in door transaction ledger
-    state.doorTransactions.unshift({
+    const tx1: FinancialTransaction = {
       id: `dt-${Date.now()}-1`,
       date: data.purchase_date,
       business_segment: 'doors',
@@ -369,10 +199,12 @@ class StorageManager {
       reference_id: newBatch.id,
       is_personal_withdrawal: false,
       created_at: new Date().toISOString(),
-    });
+    };
+    state.doorTransactions.unshift(tx1);
 
+    let tx2: FinancialTransaction | null = null;
     if (data.transport_cost > 0) {
-      state.doorTransactions.unshift({
+      tx2 = {
         id: `dt-${Date.now()}-2`,
         date: data.purchase_date,
         business_segment: 'doors',
@@ -385,14 +217,24 @@ class StorageManager {
         reference_id: newBatch.id,
         is_personal_withdrawal: false,
         created_at: new Date().toISOString(),
-      });
+      };
+      state.doorTransactions.unshift(tx2);
     }
 
-    this.persist();
+    if (state.settings.is_demo_mode) {
+      await shucadeaDB.saveDemoState(state);
+    } else {
+      await shucadeaDB.putItem('white_batches', newBatch);
+      await shucadeaDB.putItem('door_transactions', tx1);
+      if (tx2) await shucadeaDB.putItem('door_transactions', tx2);
+    }
+
     return newBatch;
   }
 
-  public recordWhiteSale(saleData: Omit<WhiteDoorSale, 'id' | 'created_at' | 'total_amount' | 'outstanding_balance'>): WhiteDoorSale {
+  public async recordWhiteSale(
+    saleData: Omit<WhiteDoorSale, 'id' | 'created_at' | 'total_amount' | 'outstanding_balance'>
+  ): Promise<WhiteDoorSale> {
     const state = this.getState();
     const batch = state.whiteBatches.find((b) => b.id === saleData.batch_id);
     if (!batch) {
@@ -403,7 +245,7 @@ class StorageManager {
     const outstanding = Math.max(0, subMoney(totalAmount, saleData.amount_received));
 
     const newSale: WhiteDoorSale = {
-      id: `ws-${Date.now()}`,
+      id: `ws-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
       ...saleData,
       total_amount: totalAmount,
       outstanding_balance: outstanding,
@@ -411,14 +253,12 @@ class StorageManager {
     };
 
     state.whiteSales.unshift(newSale);
-
-    // Update batch totals accurately
     this.recalculateBatch(batch.id);
 
-    // Auto-record collected revenue into transactions
+    let incomeTx: FinancialTransaction | null = null;
     if (saleData.amount_received > 0) {
-      state.doorTransactions.unshift({
-        id: `dt-${Date.now()}`,
+      incomeTx = {
+        id: `dt-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
         date: saleData.sale_date,
         business_segment: 'doors',
         door_type: 'white',
@@ -430,14 +270,26 @@ class StorageManager {
         reference_id: newSale.id,
         is_personal_withdrawal: false,
         created_at: new Date().toISOString(),
-      });
+      };
+      state.doorTransactions.unshift(incomeTx);
     }
 
-    this.persist();
+    if (state.settings.is_demo_mode) {
+      await shucadeaDB.saveDemoState(state);
+    } else {
+      await shucadeaDB.putItem('white_sales', newSale);
+      await shucadeaDB.putItem('white_batches', batch);
+      if (incomeTx) await shucadeaDB.putItem('door_transactions', incomeTx);
+    }
+
     return newSale;
   }
 
-  public updateWhiteBatchDamages(batchId: string, damagedDelta: number, returnedDelta: number): void {
+  public async updateWhiteBatchDamages(
+    batchId: string,
+    damagedDelta: number,
+    returnedDelta: number
+  ): Promise<void> {
     const state = this.getState();
     const batch = state.whiteBatches.find((b) => b.id === batchId);
     if (!batch) return;
@@ -445,7 +297,12 @@ class StorageManager {
     batch.damaged_doors = Math.max(0, (batch.damaged_doors || 0) + damagedDelta);
     batch.returned_doors = Math.max(0, (batch.returned_doors || 0) + returnedDelta);
     this.recalculateBatch(batchId);
-    this.persist();
+
+    if (state.settings.is_demo_mode) {
+      await shucadeaDB.saveDemoState(state);
+    } else {
+      await shucadeaDB.putItem('white_batches', batch);
+    }
   }
 
   private recalculateBatch(batchId: string): void {
@@ -463,7 +320,6 @@ class StorageManager {
       batch.quantity_purchased - quantitySold - (batch.damaged_doors || 0) + (batch.returned_doors || 0)
     );
 
-    // Gross profit = sum of (sale.unit_price - batch.purchase_price_per_door) * sale.quantity
     const grossProfit = sales.reduce((acc, s) => {
       const margin = subMoney(s.unit_price, batch.purchase_price_per_door);
       return addMoney(acc, multMoney(margin, s.quantity));
@@ -484,17 +340,17 @@ class StorageManager {
   // BROWN DOORS ACTIONS
   // ==========================================
 
-  public recordBrownPurchase(data: {
+  public async recordBrownPurchase(data: {
     purchase_date: string;
     quantity: number;
     purchase_price_per_door: number;
     supplier_notes?: string;
-  }): BrownDoorPurchase {
+  }): Promise<BrownDoorPurchase> {
     const state = this.getState();
     const totalCost = multMoney(data.purchase_price_per_door, data.quantity);
 
     const purchase: BrownDoorPurchase = {
-      id: `bp-${Date.now()}`,
+      id: `bp-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
       purchase_date: data.purchase_date,
       quantity: data.quantity,
       purchase_price_per_door: data.purchase_price_per_door,
@@ -505,9 +361,8 @@ class StorageManager {
 
     state.brownPurchases.unshift(purchase);
 
-    // Record in door ledger
-    state.doorTransactions.unshift({
-      id: `dt-${Date.now()}`,
+    const tx: FinancialTransaction = {
+      id: `dt-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
       date: data.purchase_date,
       business_segment: 'doors',
       door_type: 'brown',
@@ -519,13 +374,20 @@ class StorageManager {
       reference_id: purchase.id,
       is_personal_withdrawal: false,
       created_at: new Date().toISOString(),
-    });
+    };
+    state.doorTransactions.unshift(tx);
 
-    this.persist();
+    if (state.settings.is_demo_mode) {
+      await shucadeaDB.saveDemoState(state);
+    } else {
+      await shucadeaDB.putItem('brown_purchases', purchase);
+      await shucadeaDB.putItem('door_transactions', tx);
+    }
+
     return purchase;
   }
 
-  public recordBrownSale(data: {
+  public async recordBrownSale(data: {
     sale_date: string;
     customer_name?: string;
     customer_phone?: string;
@@ -535,13 +397,13 @@ class StorageManager {
     amount_received: number;
     payment_method: 'cash' | 'ecocash' | 'bank_transfer' | 'other';
     notes?: string;
-  }): BrownDoorSale {
+  }): Promise<BrownDoorSale> {
     const state = this.getState();
     const totalAmount = multMoney(data.unit_price, data.quantity);
     const outstanding = Math.max(0, subMoney(totalAmount, data.amount_received));
 
     const sale: BrownDoorSale = {
-      id: `bs-${Date.now()}`,
+      id: `bs-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
       ...data,
       total_amount: totalAmount,
       outstanding_balance: outstanding,
@@ -550,9 +412,10 @@ class StorageManager {
 
     state.brownSales.unshift(sale);
 
+    let tx: FinancialTransaction | null = null;
     if (data.amount_received > 0) {
-      state.doorTransactions.unshift({
-        id: `dt-${Date.now()}`,
+      tx = {
+        id: `dt-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
         date: data.sale_date,
         business_segment: 'doors',
         door_type: 'brown',
@@ -564,31 +427,37 @@ class StorageManager {
         reference_id: sale.id,
         is_personal_withdrawal: false,
         created_at: new Date().toISOString(),
-      });
+      };
+      state.doorTransactions.unshift(tx);
     }
 
-    this.persist();
+    if (state.settings.is_demo_mode) {
+      await shucadeaDB.saveDemoState(state);
+    } else {
+      await shucadeaDB.putItem('brown_sales', sale);
+      if (tx) await shucadeaDB.putItem('door_transactions', tx);
+    }
+
     return sale;
   }
 
-  public recordBrownWithdrawal(data: {
+  public async recordBrownWithdrawal(data: {
     withdrawal_date: string;
     amount: number;
     withdrawn_by: string;
     reason: string;
-  }): BrownDoorWithdrawal {
+  }): Promise<BrownDoorWithdrawal> {
     const state = this.getState();
     const withdrawal: BrownDoorWithdrawal = {
-      id: `bw-${Date.now()}`,
+      id: `bw-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
       ...data,
       created_at: new Date().toISOString(),
     };
 
     state.brownWithdrawals.unshift(withdrawal);
 
-    // Personal withdrawal must be flagged as is_personal_withdrawal: true
-    state.doorTransactions.unshift({
-      id: `dt-${Date.now()}`,
+    const tx: FinancialTransaction = {
+      id: `dt-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
       date: data.withdrawal_date,
       business_segment: 'doors',
       door_type: 'brown',
@@ -600,9 +469,16 @@ class StorageManager {
       reference_id: withdrawal.id,
       is_personal_withdrawal: true,
       created_at: new Date().toISOString(),
-    });
+    };
+    state.doorTransactions.unshift(tx);
 
-    this.persist();
+    if (state.settings.is_demo_mode) {
+      await shucadeaDB.saveDemoState(state);
+    } else {
+      await shucadeaDB.putItem('brown_withdrawals', withdrawal);
+      await shucadeaDB.putItem('door_transactions', tx);
+    }
+
     return withdrawal;
   }
 
@@ -610,13 +486,13 @@ class StorageManager {
   // FINANCIAL TRANSACTIONS
   // ==========================================
 
-  public recordTransaction(
+  public async recordTransaction(
     segment: 'doors' | 'hardware',
     tx: Omit<FinancialTransaction, 'id' | 'created_at' | 'business_segment'>
-  ): FinancialTransaction {
+  ): Promise<FinancialTransaction> {
     const state = this.getState();
     const newTx: FinancialTransaction = {
-      id: `${segment === 'doors' ? 'dt' : 'ht'}-${Date.now()}`,
+      id: `${segment === 'doors' ? 'dt' : 'ht'}-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
       business_segment: segment,
       ...tx,
       created_at: new Date().toISOString(),
@@ -628,7 +504,13 @@ class StorageManager {
       state.hardwareTransactions.unshift(newTx);
     }
 
-    this.persist();
+    if (state.settings.is_demo_mode) {
+      await shucadeaDB.saveDemoState(state);
+    } else {
+      const store = segment === 'doors' ? 'door_transactions' : 'hardware_transactions';
+      await shucadeaDB.putItem(store, newTx);
+    }
+
     return newTx;
   }
 
@@ -636,18 +518,19 @@ class StorageManager {
   // DAILY CLOSING
   // ==========================================
 
-  public recordDailyClosing(closing: Omit<DailyClosing, 'id' | 'created_at' | 'discrepancy'>): DailyClosing {
+  public async recordDailyClosing(
+    closing: Omit<DailyClosing, 'id' | 'created_at' | 'discrepancy'>
+  ): Promise<DailyClosing> {
     const state = this.getState();
     const discrepancy = subMoney(closing.actual_cash_counted, closing.expected_cash);
 
     const newClosing: DailyClosing = {
-      id: `dc-${Date.now()}`,
+      id: `dc-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
       ...closing,
       discrepancy,
       status: discrepancy === 0 ? 'balanced' : 'discrepancy',
     };
 
-    // Replace if closing for same date exists, else unshift
     const existingIndex = state.dailyClosings.findIndex((c) => c.closing_date === closing.closing_date);
     if (existingIndex >= 0) {
       newClosing.audit_history = [
@@ -664,38 +547,44 @@ class StorageManager {
       state.dailyClosings.unshift(newClosing);
     }
 
-    this.persist();
+    if (state.settings.is_demo_mode) {
+      await shucadeaDB.saveDemoState(state);
+    } else {
+      await shucadeaDB.putItem('daily_closings', newClosing);
+    }
+
     return newClosing;
   }
 
   // ==========================================
-  // PRICE LIBRARY & LEARNING SYSTEM
+  // PRICE LIBRARY & SAFE PRICE UPDATE
   // ==========================================
 
-  public saveOrUpdatePriceItem(itemData: {
+  public async saveOrUpdatePriceItem(itemData: {
     product_name: string;
     standardized_name: string;
     category: 'plumbing' | 'electrical' | 'building' | 'hardware' | 'other';
     unit: string;
     current_unit_price: number;
     reason?: string;
-  }): PriceItem {
+  }): Promise<PriceItem> {
     const state = this.getState();
     const existingIndex = state.priceLibrary.findIndex(
-      (p) => p.standardized_name === itemData.standardized_name ||
-             p.product_name.toLowerCase().trim() === itemData.product_name.toLowerCase().trim()
+      (p) =>
+        p.standardized_name === itemData.standardized_name ||
+        p.product_name.toLowerCase().trim() === itemData.product_name.toLowerCase().trim()
     );
 
     const now = new Date().toISOString();
+    let savedItem: PriceItem;
 
     if (existingIndex >= 0) {
       const existing = state.priceLibrary[existingIndex];
-      // If price changed, push to price history
       if (existing.current_unit_price !== itemData.current_unit_price) {
         existing.previous_prices.unshift({
           price: existing.current_unit_price,
           changed_at: existing.last_updated || now,
-          reason: itemData.reason || 'Price update from quotation or manual edit',
+          reason: itemData.reason || 'Price adjustment',
         });
       }
       existing.current_unit_price = itemData.current_unit_price;
@@ -703,10 +592,9 @@ class StorageManager {
       existing.category = itemData.category || existing.category;
       existing.last_updated = now.split('T')[0];
       existing.quotation_count = (existing.quotation_count || 1) + 1;
-      this.persist();
-      return existing;
+      savedItem = existing;
     } else {
-      const newItem: PriceItem = {
+      savedItem = {
         id: `pl-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
         product_name: itemData.product_name,
         standardized_name: itemData.standardized_name,
@@ -718,39 +606,80 @@ class StorageManager {
         last_updated: now.split('T')[0],
         created_at: now,
       };
-      state.priceLibrary.unshift(newItem);
-      this.persist();
-      return newItem;
+      state.priceLibrary.unshift(savedItem);
     }
+
+    if (state.settings.is_demo_mode) {
+      await shucadeaDB.saveDemoState(state);
+    } else {
+      await shucadeaDB.putItem('price_library', savedItem);
+    }
+
+    return savedItem;
   }
 
-  public deletePriceItem(id: string): void {
+  /**
+   * Explicitly updates price library from confirmed quotation items
+   * Only called when the user explicitly confirms price updates.
+   */
+  public async batchUpdatePriceLibrary(
+    itemsToUpdate: Array<{
+      product_name: string;
+      standardized_name: string;
+      category: 'plumbing' | 'electrical' | 'building' | 'hardware' | 'other';
+      unit: string;
+      current_unit_price: number;
+      reason: string;
+    }>
+  ): Promise<number> {
+    let count = 0;
+    for (const item of itemsToUpdate) {
+      await this.saveOrUpdatePriceItem(item);
+      count++;
+    }
+    return count;
+  }
+
+  public async deletePriceItem(id: string): Promise<void> {
     const state = this.getState();
     state.priceLibrary = state.priceLibrary.filter((p) => p.id !== id);
-    this.persist();
+
+    if (state.settings.is_demo_mode) {
+      await shucadeaDB.saveDemoState(state);
+    } else {
+      await shucadeaDB.deleteItem('price_library', id);
+    }
   }
 
   // ==========================================
   // QUOTATIONS
   // ==========================================
 
-  public saveQuotation(quote: Omit<Quotation, 'id' | 'created_at' | 'updated_at'>): Quotation {
+  public async saveQuotation(
+    quote: Omit<Quotation, 'id' | 'created_at' | 'updated_at'>
+  ): Promise<Quotation> {
     const state = this.getState();
     const now = new Date().toISOString();
 
     const newQuote: Quotation = {
-      id: `q-${Date.now()}`,
+      id: `q-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
       ...quote,
       created_at: now,
       updated_at: now,
     };
 
     state.quotations.unshift(newQuote);
-    this.persist();
+
+    if (state.settings.is_demo_mode) {
+      await shucadeaDB.saveDemoState(state);
+    } else {
+      await shucadeaDB.putItem('quotations', newQuote);
+    }
+
     return newQuote;
   }
 
-  public updateQuotation(id: string, updates: Partial<Quotation>): Quotation {
+  public async updateQuotation(id: string, updates: Partial<Quotation>): Promise<Quotation> {
     const state = this.getState();
     const index = state.quotations.findIndex((q) => q.id === id);
     if (index === -1) throw new Error('Quotation not found');
@@ -761,42 +690,121 @@ class StorageManager {
       updated_at: new Date().toISOString(),
     };
     state.quotations[index] = updated;
-    this.persist();
+
+    if (state.settings.is_demo_mode) {
+      await shucadeaDB.saveDemoState(state);
+    } else {
+      await shucadeaDB.putItem('quotations', updated);
+    }
+
     return updated;
   }
 
-  public deleteQuotation(id: string): void {
+  public async deleteQuotation(id: string): Promise<void> {
     const state = this.getState();
     state.quotations = state.quotations.filter((q) => q.id !== id);
-    this.persist();
-  }
 
-  // ==========================================
-  // BACKUP & RESTORE
-  // ==========================================
-
-  public exportBackupJson(): string {
-    const state = this.getState();
-    return JSON.stringify(state, null, 2);
-  }
-
-  public importBackupJson(jsonString: string): boolean {
-    try {
-      const parsed = JSON.parse(jsonString);
-      if (!parsed.settings) throw new Error('Invalid backup file');
-      this.memoryState = parsed;
-      this.persist();
-      return true;
-    } catch (err) {
-      console.error('Import failed:', err);
-      return false;
+    if (state.settings.is_demo_mode) {
+      await shucadeaDB.saveDemoState(state);
+    } else {
+      await shucadeaDB.deleteItem('quotations', id);
     }
   }
 
-  public clearLiveDatabase(): void {
-    const settings = this.loadSettings();
-    this.memoryState = getInitialEmptyLiveState(settings);
-    this.persist();
+  // ==========================================
+  // BACKUP, VALIDATION & RESTORE
+  // ==========================================
+
+  public async exportBackupJson(): Promise<string> {
+    const state = this.getState();
+    const exportTime = new Date().toISOString();
+
+    // Update last backup date
+    state.settings.last_backup_date = exportTime;
+    await this.saveSettings(state.settings);
+
+    const payload = {
+      app: 'SHUCADEA_MANAGER',
+      format_version: 1,
+      exported_at: exportTime,
+      data: state,
+    };
+
+    return JSON.stringify(payload, null, 2);
+  }
+
+  public validateBackup(jsonString: string): BackupValidationResult {
+    try {
+      const parsed = JSON.parse(jsonString);
+      const data = parsed.data || parsed;
+
+      if (!data || typeof data !== 'object') {
+        return { valid: false, error: 'File is not a valid JSON object.' };
+      }
+
+      if (!Array.isArray(data.quotations) && !Array.isArray(data.priceLibrary)) {
+        return {
+          valid: false,
+          error: 'File does not contain valid Shucadea business data collections.',
+        };
+      }
+
+      return {
+        valid: true,
+        summary: {
+          exportDate: parsed.exported_at || new Date().toISOString(),
+          quotationCount: Array.isArray(data.quotations) ? data.quotations.length : 0,
+          priceLibraryCount: Array.isArray(data.priceLibrary) ? data.priceLibrary.length : 0,
+          whiteBatchesCount: Array.isArray(data.whiteBatches) ? data.whiteBatches.length : 0,
+          brownPurchasesCount: Array.isArray(data.brownPurchases) ? data.brownPurchases.length : 0,
+          transactionsCount:
+            (Array.isArray(data.doorTransactions) ? data.doorTransactions.length : 0) +
+            (Array.isArray(data.hardwareTransactions) ? data.hardwareTransactions.length : 0),
+          dailyClosingsCount: Array.isArray(data.dailyClosings) ? data.dailyClosings.length : 0,
+        },
+      };
+    } catch (e: any) {
+      return { valid: false, error: 'JSON parsing failed: ' + (e?.message || 'Invalid syntax') };
+    }
+  }
+
+  public async importBackupJson(
+    jsonString: string
+  ): Promise<{ success: boolean; error?: string }> {
+    const validation = this.validateBackup(jsonString);
+    if (!validation.valid) {
+      return { success: false, error: validation.error };
+    }
+
+    try {
+      const parsed = JSON.parse(jsonString);
+      const data: AppDatabaseState = parsed.data || parsed;
+
+      // 1. Create a safety backup of current state before restoring
+      const currentBackup = await this.exportBackupJson();
+      try {
+        localStorage.setItem(
+          'shucadea_auto_pre_restore_backup',
+          JSON.stringify({
+            created_at: new Date().toISOString(),
+            backup: currentBackup,
+          })
+        );
+      } catch (err) {
+        console.warn('Could not save pre-restore backup in localStorage', err);
+      }
+
+      // 2. Perform atomic replacement in IndexedDB
+      await shucadeaDB.replaceAllLiveData(data);
+
+      // 3. Update memory state
+      this.memoryState = data;
+
+      return { success: true };
+    } catch (err: any) {
+      console.error('Failed to import backup:', err);
+      return { success: false, error: err?.message || 'Failed to restore backup' };
+    }
   }
 }
 

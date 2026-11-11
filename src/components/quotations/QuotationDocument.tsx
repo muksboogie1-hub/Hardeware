@@ -175,9 +175,15 @@ export const QuotationDocument: React.FC<QuotationDocumentProps> = ({
                 {settings.tagline}
               </p>
               <div className="text-xs text-slate-500 mt-1 space-y-0.5">
-                <p>{settings.address}</p>
-                <p>Phone: {settings.phone} · WhatsApp: {settings.whatsapp}</p>
-                <p>Email: {settings.email}</p>
+                {settings.address && <p>{settings.address}</p>}
+                {(settings.phone || settings.whatsapp) && (
+                  <p>
+                    {settings.phone && <span>Phone: {settings.phone}</span>}
+                    {settings.phone && settings.whatsapp && <span> · </span>}
+                    {settings.whatsapp && <span>WhatsApp: {settings.whatsapp}</span>}
+                  </p>
+                )}
+                {settings.email && <p>Email: {settings.email}</p>}
               </div>
             </div>
           </div>
